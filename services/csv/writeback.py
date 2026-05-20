@@ -5,8 +5,8 @@ import io
 from collections import OrderedDict
 from typing import Any
 
-from cron_job.gcs_client import download_text, list_blob_uris, parse_gcs_uri, upload_text
-from cron_job.models import ExtractionRunResult
+from cron_job.services.gcs import download_text, list_blob_uris, parse_gcs_uri, upload_text
+from cron_job.schemas.models import ExtractionRunResult
 
 
 KEY_COLUMNS = {"document_id", "plot_uid", "plot", "plot_id", "plot_barcode"}

@@ -3,8 +3,8 @@ from __future__ import annotations
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 
-from cron_job.csv_assembler import _image_uri_from_fields
-from cron_job.models import ScannedDocument, SubtrialDocuments, SubtrialInfo
+from cron_job.services.csv.assembler import _image_uri_from_fields
+from cron_job.schemas.models import ScannedDocument, SubtrialDocuments, SubtrialInfo
 
 
 def _doc_to_dict(snapshot) -> dict[str, Any]:

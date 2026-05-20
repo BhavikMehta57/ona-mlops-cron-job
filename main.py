@@ -12,20 +12,20 @@ from pathlib import PurePosixPath
 from typing import Iterable, Sequence
 
 from cron_job.core.config import AppConfig, load_config
-from cron_job.csv_assembler import _meta_image_uuid, upload_classical_csv, upload_csv
-from cron_job.csv_writeback import write_back_csv
+from cron_job.services.csv.assembler import _meta_image_uuid, upload_classical_csv, upload_csv
+from cron_job.services.csv.writeback import write_back_csv
 from cron_job.db.firestore import get_firestore_client
 from cron_job.db.gstorage import get_storage_client
-from cron_job.firestore_client import discover_active_subtrials, scan_subtrial_documents
-from cron_job.firestore_writeback import (
+from cron_job.services.firestore.scanner import discover_active_subtrials, scan_subtrial_documents
+from cron_job.services.firestore.writeback import (
     build_selected_image_prefixes,
     read_selected_image_rows,
     write_back_inference_results,
     write_back_preprocessing_status,
 )
-from cron_job.inference_client import run_inference
+from cron_job.services.inference import run_inference
 from cron_job.middleware.logger import get_logger
-from cron_job.models import (
+from cron_job.schemas.models import (
     CanonicalTrait,
     ExtractionRunResult,
     InferenceJobResult,
@@ -36,10 +36,10 @@ from cron_job.models import (
     SubtrialInfo,
     SubtrialState,
 )
-from cron_job.preprocessor_client import run_preprocessing, selected_shards_from_firestore
-from cron_job.protocol_trait_resolver import group_documents_by_protocol_trait, inference_trait_type
-from cron_job.trait_extractor import CloudRunJobClient, run_classical_extractions, run_cv_extractions
-from cron_job.gcs_client import download_text, list_blob_uris, parse_gcs_uri
+from cron_job.services.preprocessor import run_preprocessing, selected_shards_from_firestore
+from cron_job.services.utils.protocol_trait import group_documents_by_protocol_trait, inference_trait_type
+from cron_job.services.trait_extractor import CloudRunJobClient, run_classical_extractions, run_cv_extractions
+from cron_job.services.gcs import download_text, list_blob_uris, parse_gcs_uri
 
 
 def _utc_now() -> datetime:

@@ -12,8 +12,8 @@ from firebase_admin import firestore
 from google.auth.transport.requests import Request
 
 from cron_job.core.config import AppConfig
-from cron_job.gcs_client import make_gcs_uri
-from cron_job.models import ExtractionRunResult, InferenceJobResult, ProtocolTraitGroup
+from cron_job.services.gcs import make_gcs_uri
+from cron_job.schemas.models import ExtractionRunResult, InferenceJobResult, ProtocolTraitGroup
 
 try:
     import google.auth

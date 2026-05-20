@@ -92,7 +92,7 @@ The Daily Pipeline Cron Job is a scheduled GCP batch orchestrator that:
 
 ## 2.3 Non-goals
 
-- This job does not replace the existing preprocessor, inference service, or trait extraction CLI.
+- This job does not replace the existing preprocessor, inference service, or trait extraction Cloud Run Job.
 - This job does not own ML model lifecycle, model versioning, or training.
 - This job does not provide an end-user UI.
 - This job does not persist a canonical pipeline run registry in Firestore unless the optional audit schema is added.
@@ -108,7 +108,7 @@ The Daily Pipeline Cron Job is a scheduled GCP batch orchestrator that:
 | GCS bucket `ona-harvest` | Stores raw CSVs, inference artifacts, extraction outputs, and optionally manifests. |
 | `e2e_prerops` | Preprocesses image CSV data and determines selected/rejected/skipped images. |
 | `ona-infer` | Runs asynchronous batch inference jobs for unique image protocol-trait groups. |
-| Trait extraction CLI | Produces derived trait outputs for CV and classical paths. |
+| Trait extraction Cloud Run Job (`ona-trait-extraction`) | Produces derived trait outputs for CV and classical paths. Invoked via the Cloud Run Jobs API with an inline run-spec. |
 | Cloud Logging | Stores structured run, stage, and failure logs. |
 | Secret Manager | Supplies runtime secrets where needed. |
 
@@ -262,31 +262,31 @@ flowchart LR
 
     JOB --> PRE[e2e_prerops\nPreprocessor Service]
     JOB --> INF[ona-infer\nBatch Inference Service]
-    JOB --> EXT[Trait Extraction CLI\nsubprocess in Job container]
+    JOB --> EXT[ona-trait-extraction\nCloud Run Job]
 ```
 
 ## 3.2 Component architecture
 
 ```mermaid
 flowchart TD
-    MAIN[main.py\nOrchestrator] --> CFG[config/bootstrap]
-    MAIN --> DISC[firestore_client.py\nDiscovery + Scanning]
-    MAIN --> CSV[csv_assembler.py]
-    MAIN --> GCS[gcs_client.py]
-    MAIN --> PRE[preprocessor_client.py]
-    MAIN --> PTR[protocol_trait_resolver.py]
-    MAIN --> INF[inference_client.py]
-    MAIN --> EXT[trait_extractor.py]
-    MAIN --> WB[csv_writeback.py]
-    MAIN --> FSWB[firestore_writeback.py]
-    MAIN --> LOG[logger.py]
+    MAIN[main.py\nOrchestrator] --> CFG[core/config.py]
+    MAIN --> DISC[services/firestore/scanner.py\nDiscovery + Scanning]
+    MAIN --> CSV[services/csv/assembler.py]
+    MAIN --> GCS[services/gcs.py]
+    MAIN --> PRE[services/preprocessor.py]
+    MAIN --> PTR[services/utils/protocol_trait.py]
+    MAIN --> INF[services/inference.py]
+    MAIN --> EXT[services/trait_extractor.py]
+    MAIN --> WB[services/csv/writeback.py]
+    MAIN --> FSWB[services/firestore/writeback.py]
+    MAIN --> LOG[middleware/logger.py]
 
     DISC --> FS[(Firestore)]
     CSV --> GCS
     GCS --> OBJ[(GCS Objects)]
     PRE --> PP[e2e_prerops]
     INF --> OI[ona-infer]
-    EXT --> CLI[Trait Extraction CLI]
+    EXT --> CRJ[ona-trait-extraction Cloud Run Job]
     FSWB --> FS
     LOG --> CL[Cloud Logging]
 ```
@@ -368,14 +368,14 @@ flowchart TD
 ```mermaid
 sequenceDiagram
     participant M as main.py
-    participant CSV as csv_assembler.py
+    participant CSV as services/csv/assembler.py
     participant G as GCS
     participant P as e2e_prerops
-    participant R as protocol_trait_resolver.py
-    participant I as inference_client.py
+    participant R as services/utils/protocol_trait.py
+    participant I as services/inference.py
     participant O as ona-infer
-    participant E as trait_extractor.py
-    participant W as csv_writeback.py
+    participant E as services/trait_extractor.py
+    participant W as services/csv/writeback.py
     participant F as Firestore
 
     M->>CSV: assemble_images_csv(image_docs)
@@ -425,10 +425,10 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant M as main.py
-    participant R as protocol_trait_resolver.py
-    participant CSV as csv_assembler.py
+    participant R as services/utils/protocol_trait.py
+    participant CSV as services/csv/assembler.py
     participant G as GCS
-    participant E as trait_extractor.py
+    participant E as services/trait_extractor.py
 
     M->>R: resolve classical protocol-trait groups
     R-->>M: valid groups
@@ -461,61 +461,100 @@ flowchart LR
 
 # 4. Low-Level Design
 
-## 4.1 Suggested package structure
+## 4.1 Package structure
+
+The current implementation uses a layered structure that groups files by responsibility. Empty placeholder modules from earlier scaffolding have been removed.
 
 ```text
 cron_job/
 |-- __init__.py
-|-- main.py
-|-- config.py
-|-- logger.py
-|-- firestore_client.py
-|-- csv_assembler.py
-|-- gcs_client.py
-|-- preprocessor_client.py
-|-- protocol_trait_resolver.py
-|-- inference_client.py
-|-- trait_extractor.py
-|-- csv_writeback.py
-|-- firestore_writeback.py
-|-- errors.py
-|-- models.py
+|-- main.py                          # CLI entrypoint, argparse, run() router
 |-- Dockerfile
+|-- cloudbuild.yaml
 |-- requirements.txt
-|-- README.md
+|-- core/
+|   `-- config.py                    # AppConfig + load_config from environment
+|-- db/
+|   |-- firestore.py                 # Firestore admin client bootstrap
+|   `-- gstorage.py                  # GCS client bootstrap
+|-- middleware/
+|   |-- logger.py                    # StructuredLogger emitting JSON to Cloud Logging
+|   `-- logging.py
+|-- schemas/
+|   |-- models.py                    # Dataclasses: RunContext, SubtrialInfo, ScannedDocument,
+|   |                                #             ProtocolTraitGroup, PreprocessorResult,
+|   |                                #             InferenceJobResult, ExtractionRunResult, SubtrialState
+|   |-- image.py
+|   `-- plot.py
+|-- services/
+|   |-- gcs.py                       # GCS URI/bytes helpers
+|   |-- preprocessor.py              # e2e_prerops HTTP adapter
+|   |-- inference.py                 # ona-infer HTTP adapter (concurrent submission + polling)
+|   |-- trait_extractor.py           # Cloud Run Job adapter for ona-trait-extraction
+|   |-- csv/
+|   |   |-- assembler.py             # CSV row/header assembly + raw uploads
+|   |   `-- writeback.py             # CSV merge of extraction outputs onto raw CSV
+|   |-- firestore/
+|   |   |-- scanner.py               # Discovery + per-subtrial document scanning
+|   |   `-- writeback.py             # Per-doc preprocessing/inference field writes
+|   `-- utils/
+|       `-- protocol_trait.py        # Trait keyword resolver and group assembly
+|-- docs/
+|   |-- daily_pipeline_design_pack.md
+|   |-- daily_pipeline_mermaid_diagrams.md
+|   |-- LOCAL_TESTING_AND_DEPLOYMENT.md
+|   `-- PLAN.md
 `-- tests/
-    |-- __init__.py
-    |-- conftest.py
-    |-- test_logger.py
-    |-- test_firestore_client.py
+    |-- conftest.py                  # CaptureLogger, app_config, doc/group fixtures
+    |-- test_daily_pipeline_units.py
+    |-- test_daily_pipeline_adapters.py
     |-- test_csv_assembler.py
-    |-- test_gcs_client.py
-    |-- test_preprocessor_client.py
-    |-- test_protocol_trait_resolver.py
-    |-- test_inference_client.py
-    |-- test_trait_extractor.py
     |-- test_csv_writeback.py
+    |-- test_gcs_client.py
+    |-- test_firestore_scanner.py
     |-- test_firestore_writeback.py
-    |-- test_main.py
-    `-- test_integration.py
+    |-- test_logger.py
+    |-- test_trait_extractor.py
+    |-- test_classical_path.py
+    `-- test_multi_date_orchestration.py
 ```
 
+Notes:
+- A dedicated `errors.py` module is not used; the codebase relies on standard exceptions (`ValueError`, `RuntimeError`) and structured-logger `errors` payloads instead of custom exception classes.
+- Stages live in `main.py` rather than a separate `stages/` package; the orchestrator was kept intentionally compact.
+
 ## 4.2 Configuration model
+
+The actual `AppConfig` lives in `cron_job/core/config.py`. It is loaded from environment variables via `load_config(require_services=True)`.
 
 ```python
 @dataclass(frozen=True)
 class AppConfig:
-    firestore_project_id: str
     gcs_bucket: str
     preprocessor_url: str
     inference_url: str
-    cloud_region: str = "us-central1"
+    gcp_project_id: str
+    firestore_database_id: str = "artemis-prod"
+    gcp_run_region: str = "us-central1"
+    trait_extraction_job_id: str = "ona-trait-extraction"
+    trait_extraction_runs_collection: str = "trait_extraction_runs"
+    firebase_storage_bucket: str = "artemis-418513.firebasestorage.app"
+    raw_prefix_root: str = "raw"
+    inference_prefix_root: str = "inference"
+    extraction_prefix_root: str = "extraction"
+    selected_images_bucket: str = "artemis-revamp"
     preprocessor_poll_timeout_s: int = 3600
     preprocessor_request_timeout_s: int = 30
     preprocessor_transient_error_limit: int = 5
     inference_poll_timeout_s: int = 7200
-    extraction_subprocess_timeout_s: int = 300
-    job_timezone: str = "UTC"
+    inference_request_timeout_s: int = 60
+    trait_extraction_poll_timeout_s: int = 24 * 60 * 60
+    trait_extraction_request_timeout_s: int = 30
+    inference_confidence: float = 0.5
+    inference_limit: int = 1_000_000
+    use_cloud_logging: bool = True
+    firebase_credentials: dict[str, Any] | None = None
+    gcp_service_account_credentials: dict[str, Any] | None = None
 ```
 
 ### Configuration principles
@@ -1197,16 +1236,15 @@ Use per-task exception handling inside `submit_and_poll_one` so one failed group
 
 `planting_date` is added only when `canonical_trait_name == "flowering"` and the subtrial/trial/layout has a planting-date field. If the field is missing for a flowering group, extraction still runs but downstream day-after-planting calculations may be unreliable; a warning is logged.
 
-### 4.11.3 Subprocess policy
+### 4.11.3 Cloud Run Job invocation policy
 
-- Execute:
-  - `python -m trait_extraction.runner.entrypoint --run-spec-json '<json>'`
-- Timeout:
-  - 300 seconds
-- Results:
-  - exit `0`: success
-  - non-zero: failure and capture stderr
-  - timeout: kill subprocess and log timeout
+- Each extraction is invoked via a single POST to the Cloud Run Jobs API:
+  `POST https://run.googleapis.com/v2/projects/{project}/locations/{region}/jobs/{job_id}:run`
+- The request body uses `overrides.containerOverrides[0].args` to pass `["-m", "trait_extraction.runner.entrypoint", "--run-spec-json", "<json>"]` so the run-spec is delivered inline to the same image rather than via a side-channel CSV / argument list.
+- The orchestrator polls the resulting operation until its `done` field is true, then polls the resolved execution until it reaches a terminal state (`completed`, `failed`, `cancelled`).
+- Per-run audit records are written to Firestore at `trait_extraction_runs/{audit_run_id}` with the run-spec, operation name, execution name, status counts, and final timestamps.
+- Polling cadence: 15 second sleeps between status checks. Total timeout: `trait_extraction_poll_timeout_s` (default 24h).
+- No client-side retries: a failed extraction returns a failed `ExtractionRunResult`; the per-run audit record records the final terminal status.
 
 ## 4.12 CSV write-back LLD
 
@@ -1377,7 +1415,7 @@ Any of the following occurs:
 | Preprocessor status polling | Repeated until terminal/timeout/error cap |
 | Inference batch start | No retry |
 | Inference status polling | Repeated until terminal/timeout |
-| Trait extraction subprocess | No retry |
+| Trait extraction Cloud Run Job | No retry beyond the polling loop |
 | Firestore write-back | No retry beyond batched writes |
 | CSV write-back | No retry unless re-run of job |
 
@@ -1393,51 +1431,39 @@ Any of the following occurs:
 
 ## 4.17 Testing strategy
 
-### 4.17.1 Unit tests
+The test suite lives at `cron_job/tests/` and uses pytest with `monkeypatch` for service stubbing. There are no property-based tests, no `respx` HTTP fixtures, and no full-stack integration harness; the suite stays fast and deterministic by mocking adapters and using small in-memory fakes for Firestore and GCS.
 
-Cover:
-- logger JSON structure
-- active trial/subtrial discovery
-- nested image scans
-- timestamp filtering
-- CSV deterministic header logic
-- GCS upload/delete/download/list
-- preprocessor polling terminal conditions
-- inference concurrent submission and timeout behavior
-- trait mapping and extraction RunSpec construction
-- CSV write-back merge logic
-- Firestore batch chunking and error swallowing
-- orchestrator exit code behavior
+### 4.17.1 Test files and what they cover
 
-### 4.17.2 Property tests
+| File | Focus |
+|---|---|
+| `test_daily_pipeline_units.py` | CSV header determinism, protocol/trait grouping, Firestore discovery dedup, scan window math, `process_subtrial` skip/fail paths, `CloudRunJobClient` inline run-spec body |
+| `test_daily_pipeline_adapters.py` | argparse defaults, multi-date `+`/`;` separator parsing, step prefix overrides, preprocessor request body, inference batch submission, `_execution_status` mapping, `run()` exit codes, multi-date routing |
+| `test_csv_assembler.py` | `_classical_phenotyping_path` six-field requirement, image URI composition, `_meta_image_uuid` stem extraction with fallbacks |
+| `test_csv_writeback.py` | Joining extraction CSVs onto raw CSV by `document_id` / `plot_uid`, trait-suffixed columns, excluded source columns, missing-raw and failed-extraction handling |
+| `test_gcs_client.py` | URI parsing, upload/download/delete/exists, `safe_delete_many` error swallowing, prefix listing |
+| `test_firestore_scanner.py` | UTC day window, `_is_in_window` boundaries, `_matches_data_collection_date` prefix filter, identity helpers `_make_trial_id` / `_make_subtrial_id` |
+| `test_firestore_writeback.py` | `_truthy` parsing, `read_selected_image_rows` decoding, `build_selected_image_prefixes` selection logic, batch chunking by 400, error swallowing on commit failures |
+| `test_logger.py` | Required JSON schema (`run_id` / `stage` / `status` / `timestamp`), kwargs merging, exception traceback formatting, stdout fallback |
+| `test_trait_extractor.py` | CV dedup by `(canonical_trait, output_gcs_path)`, planting-date attached only to flowering, classical per-group RunSpec, failure capture, `_execution_status` cancelled paths |
+| `test_classical_path.py` | One classical CSV per trait group, no-groups → failed, no-docs → not_applicable, partial-upload-failure isolation |
+| `test_multi_date_orchestration.py` | Per-date sequential scans, combined CV extraction call, per-trait classical CSV uploads in phase 2, per-date failure isolation |
 
-Retain the provided property test ideas:
+### 4.17.2 Shared fixtures
 
-- every discovered subtrial processed exactly once
-- failed subtrial does not skip later subtrials
-- summary count consistency
-- polling termination
-- bounded backoff
-- deterministic CSV headers
-- per-group fault isolation
-- write-back merge correctness
-- RunSpec correctness
-- Firestore write-back never changes subtrial status
+`tests/conftest.py` provides:
 
-### 4.17.3 Integration tests
+- `CaptureLogger` — drop-in for the structured logger that records entries in a list and exposes a `find(stage=, status=)` filter helper.
+- `app_config` — a permissive `AppConfig` with disabled cloud logging and short timeouts.
+- `make_image_doc`, `make_classical_doc`, `make_subtrial_info`, `make_inference_result`, `make_group` — typed builders that hide the boilerplate of constructing dataclass models with realistic defaults.
 
-Use:
-- `respx` for HTTP
-- in-memory GCS fake
-- in-memory Firestore fake
-- mocked subprocess runner
+### 4.17.3 Conventions
 
-Verify:
-- stage ordering
-- CV/classical independence
-- subtrial continuation after failures
-- summary logging
-- final exit code
+- Adapter modules (`services/preprocessor.py`, `services/inference.py`, `services/trait_extractor.py`) are exercised via `monkeypatch.setattr("cron_job.services.<module>.httpx.Client", ...)` with a minimal `HttpClient` fake that records `posts` and `gets`.
+- Firestore is exercised via small `Fake*` classes (snapshots, collection refs, document refs) declared in the test files. There is no shared in-memory Firestore fake; each test scopes the fake to what it asserts on.
+- GCS is exercised via an in-memory dict-backed `InMemoryStorage` declared per-test where needed.
+- Tests assert on log entries (using `CaptureLogger.find()`) when behaviour is observable through logs only.
+- New behaviour added to the orchestration must come with a corresponding test that pins the expected adapter calls or log entries; production code should not be the only source of truth.
 
 ---
 
@@ -1827,7 +1853,7 @@ The CSV write-back module needs a stable output contract that includes:
 - preferably `collection_path`
 - a flat or normalizable measurement payload
 
-If the CLI emits heterogeneous JSON/CSV per trait, `csv_writeback.py` should use trait-specific adapters behind a shared normalization interface.
+If the CLI emits heterogeneous JSON/CSV per trait, `services/csv/writeback.py` should use trait-specific adapters behind a shared normalization interface.
 
 ---
 

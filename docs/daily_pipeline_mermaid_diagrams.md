@@ -13,31 +13,31 @@ flowchart LR
 
     JOB --> PRE[e2e_prerops\nPreprocessor Service]
     JOB --> INF[ona-infer\nBatch Inference Service]
-    JOB --> EXT[Trait Extraction CLI\nsubprocess in Job container]
+    JOB --> EXT[ona-trait-extraction\nCloud Run Job]
 ```
 
 ## 2. Component architecture
 
 ```mermaid
 flowchart TD
-    MAIN[main.py\nOrchestrator] --> CFG[config/bootstrap]
-    MAIN --> DISC[firestore_client.py\nDiscovery + Scanning]
-    MAIN --> CSV[csv_assembler.py]
-    MAIN --> GCS[gcs_client.py]
-    MAIN --> PRE[preprocessor_client.py]
-    MAIN --> PTR[protocol_trait_resolver.py]
-    MAIN --> INF[inference_client.py]
-    MAIN --> EXT[trait_extractor.py]
-    MAIN --> WB[csv_writeback.py]
-    MAIN --> FSWB[firestore_writeback.py]
-    MAIN --> LOG[logger.py]
+    MAIN[main.py\nOrchestrator] --> CFG[core/config.py]
+    MAIN --> DISC[services/firestore/scanner.py\nDiscovery + Scanning]
+    MAIN --> CSV[services/csv/assembler.py]
+    MAIN --> GCS[services/gcs.py]
+    MAIN --> PRE[services/preprocessor.py]
+    MAIN --> PTR[services/utils/protocol_trait.py]
+    MAIN --> INF[services/inference.py]
+    MAIN --> EXT[services/trait_extractor.py]
+    MAIN --> WB[services/csv/writeback.py]
+    MAIN --> FSWB[services/firestore/writeback.py]
+    MAIN --> LOG[middleware/logger.py]
 
     DISC --> FS[(Firestore)]
     CSV --> GCS
     GCS --> OBJ[(GCS Objects)]
     PRE --> PP[e2e_prerops]
     INF --> OI[ona-infer]
-    EXT --> CLI[Trait Extraction CLI]
+    EXT --> CRJ[ona-trait-extraction Cloud Run Job]
     FSWB --> FS
     LOG --> CL[Cloud Logging]
 ```
@@ -119,14 +119,14 @@ flowchart TD
 ```mermaid
 sequenceDiagram
     participant M as main.py
-    participant CSV as csv_assembler.py
+    participant CSV as services/csv/assembler.py
     participant G as GCS
     participant P as e2e_prerops
-    participant R as protocol_trait_resolver.py
-    participant I as inference_client.py
+    participant R as services/utils/protocol_trait.py
+    participant I as services/inference.py
     participant O as ona-infer
-    participant E as trait_extractor.py
-    participant W as csv_writeback.py
+    participant E as services/trait_extractor.py
+    participant W as services/csv/writeback.py
     participant F as Firestore
 
     M->>CSV: assemble_images_csv(image_docs)
@@ -176,10 +176,10 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant M as main.py
-    participant R as protocol_trait_resolver.py
-    participant CSV as csv_assembler.py
+    participant R as services/utils/protocol_trait.py
+    participant CSV as services/csv/assembler.py
     participant G as GCS
-    participant E as trait_extractor.py
+    participant E as services/trait_extractor.py
 
     M->>R: resolve classical protocol-trait groups
     R-->>M: valid groups

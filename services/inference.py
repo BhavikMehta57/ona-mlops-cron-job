@@ -8,8 +8,8 @@ from typing import Callable
 import httpx
 
 from cron_job.core.config import AppConfig
-from cron_job.gcs_client import make_gcs_uri
-from cron_job.models import InferenceJobResult, ProtocolTraitGroup
+from cron_job.services.gcs import make_gcs_uri
+from cron_job.schemas.models import InferenceJobResult, ProtocolTraitGroup
 
 
 SUCCESS_STATUSES = {"completed", "complete", "success", "succeeded"}
