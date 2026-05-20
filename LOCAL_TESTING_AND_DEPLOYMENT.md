@@ -219,6 +219,9 @@ Grant the Cloud Run Job service account:
 
 - gcloud run jobs update daily-pipeline-cron-job --image us-central1-docker.pkg.dev/artemis-418513/ona-jobs/daily-pipeline-cron-job:v4 --region us-central1
 
+- gcloud run jobs execute mlops-pipeline-job --region us-central1 `
+--args="--data-collected-dates,YYYY-MM-DD+YYYY-MM-DD,--trial-id,TRIAL_ID,--subtrial-id,SUBTRIAL_ID"
+
 ## Example Powershell Scripts and Runs
 
 .\naro-main-trial\runs.ps1 2>&1 | Tee-Object -FilePath cron_job/naro-main-trial/runs2.txt
