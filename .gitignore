@@ -1,0 +1,36 @@
+# Environment Config Files
+.env
+
+# Ignore log files
+logs/
+cloud_log/
+local_test_output/
+
+# Ignore runs
+naro-main-trial/
+
+# Firebase Files
+artemis-418513-firebase-adminsdk-fbsvc-c732b80b5c.json
+
+# GCloud SA
+artemis-418513-8f1fa8a5c094.json
+
+# Cache Files
+**/__pycache__/
+*.pyc
+*.pytest_cache
+.hypothesis
+
+#Info files
+*.egg-info
+
+# Documentation Files
+PLAN.md
+docs/
+
+# Test Scripts
+tests/
+
+# Backfill Scripts
+app/scripts/
+scripts/
