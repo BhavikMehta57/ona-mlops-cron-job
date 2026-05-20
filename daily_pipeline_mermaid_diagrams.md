@@ -42,7 +42,7 @@ flowchart TD
     LOG --> CL[Cloud Logging]
 ```
 
-## 3. Per-subtrial orchestration
+## 3. Per-subtrial orchestration (single-date mode)
 
 ```mermaid
 flowchart TD
@@ -53,7 +53,7 @@ flowchart TD
 
     D --> ICSV{Image docs exist?}
     ICSV -->|No| ISKIP[Skip CV path]
-    ICSV -->|Yes| I1[Create + upload Images CSV]
+    ICSV -->|Yes| I1[Create + upload Images CSV per protocol]
     I1 --> I2{Upload OK?}
     I2 -->|No| IF[CV path failed]
     I2 -->|Yes| I3[Start preprocessing]
@@ -65,26 +65,53 @@ flowchart TD
     I8 --> I9[Poll inference jobs independently]
     I9 --> I10[Write successful inference metadata to Firestore]
     I10 --> I11[Run CV extraction per unique output path]
-    I11 --> I12[Merge extraction results into Images CSV]
 
     D --> CCSV{Classical docs exist?}
     CCSV -->|No| CSKIP[Skip classical path]
-    CCSV -->|Yes| C1[Create + upload Classical CSV]
-    C1 --> C2{Upload OK?}
+    CCSV -->|Yes| C0[Resolve classical protocol-trait groups]
+    C0 --> C1[For each group: filter docs + upload trait-specific CSV]
+    C1 --> C2{Any group CSV uploaded?}
     C2 -->|No| CF[Classical path failed]
-    C2 -->|Yes| C3[Resolve classical protocol-trait groups]
-    C3 --> C4[Run classical extraction per group]
-    C4 --> C5[Merge extraction results into Classical CSV]
+    C2 -->|Yes| C4[Run classical extraction per group with its own CSV]
 
     ISKIP --> END[Finalize Subtrial Status]
     IF --> END
     I5 --> END
-    I12 --> END
+    I11 --> END
     CSKIP --> END
     CF --> END
-    C5 --> END
+    C4 --> END
     Z --> DONE[Continue Next Subtrial]
     END --> DONE
+```
+
+## 3.1 Multi-date orchestration
+
+```mermaid
+flowchart TD
+    M0[Start Multi-Date Run] --> M1[Load single subtrial]
+    M1 --> P1[Phase 1: per-date loop]
+
+    P1 --> D1[Scan docs for date N]
+    D1 --> D2{Any docs?}
+    D2 -->|No| D9[Skip this date]
+    D2 -->|Yes| D3[Upload date-suffixed images CSV]
+    D3 --> D4[Run preprocessing for date N]
+    D4 --> D5{Preprocess OK?}
+    D5 -->|No| D9
+    D5 -->|Yes| D6[Run inference for date N]
+    D6 --> D7[Append successful inference results to combined list]
+    D7 --> D8[Append classical docs to combined list]
+    D8 --> DN{More dates?}
+    D9 --> DN
+    DN -->|Yes| D1
+    DN -->|No| P2[Phase 2: combined extraction]
+
+    P2 --> P3[Run CV extraction with combined inference results]
+    P3 --> P4[Group combined classical docs by protocol-trait]
+    P4 --> P5[For each trait group: filter docs + upload combined classical CSV]
+    P5 --> P6[Run classical extraction per group]
+    P6 --> P7[Finalize subtrial status]
 ```
 
 ## 4. CV path sequence
@@ -149,27 +176,23 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant M as main.py
+    participant R as protocol_trait_resolver.py
     participant CSV as csv_assembler.py
     participant G as GCS
-    participant R as protocol_trait_resolver.py
     participant E as trait_extractor.py
-    participant W as csv_writeback.py
-
-    M->>CSV: assemble_classical_csv(classical_docs)
-    CSV->>G: upload classical CSV
-    G-->>CSV: classical_csv_uri
-    CSV-->>M: classical_csv_uri
 
     M->>R: resolve classical protocol-trait groups
     R-->>M: valid groups
 
     loop each group
-        M->>E: run classical extraction(input_csv)
+        M->>M: filter docs to group source_document_ids
+        M->>CSV: upload_classical_csv(filtered_docs)
+        CSV->>G: upload trait-specific classical CSV
+        G-->>CSV: group_classical_csv_uri
+        CSV-->>M: group_classical_csv_uri
+        M->>E: run classical extraction with this group's CSV
         E-->>M: extraction result
     end
-
-    M->>W: merge extraction results into Classical CSV
-    W->>G: overwrite enriched classical CSV
 ```
 
 ## 6. Firestore logical model
