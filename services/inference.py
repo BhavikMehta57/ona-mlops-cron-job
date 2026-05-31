@@ -173,7 +173,7 @@ def _submit_and_poll_one(
         "confidence": model_confidence,
         "trait_type": group.inference_trait_type,
         "async_processing": True,
-        "queue": "ona-infer-queue-test",
+        "queue": "ona-infer-queue-1",
         "location": "us-central1",
     }
 
