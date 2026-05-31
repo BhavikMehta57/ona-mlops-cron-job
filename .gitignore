@@ -21,16 +21,5 @@ artemis-418513-8f1fa8a5c094.json
 *.pytest_cache
 .hypothesis
 
-#Info files
-*.egg-info
-
 # Documentation Files
-PLAN.md
-docs/
-
-# Test Scripts
-tests/
-
-# Backfill Scripts
-app/scripts/
-scripts/
+docs/PLAN.md

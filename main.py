@@ -12,20 +12,20 @@ from pathlib import PurePosixPath
 from typing import Iterable, Sequence
 
 from cron_job.core.config import AppConfig, load_config
-from cron_job.csv_assembler import _meta_image_uuid, upload_classical_csv, upload_csv
-from cron_job.csv_writeback import write_back_csv
+from cron_job.services.csv.assembler import _meta_image_uuid, upload_classical_csv, upload_csv
+from cron_job.services.csv.writeback import write_back_csv
 from cron_job.db.firestore import get_firestore_client
 from cron_job.db.gstorage import get_storage_client
-from cron_job.firestore_client import discover_active_subtrials, scan_subtrial_documents
-from cron_job.firestore_writeback import (
+from cron_job.services.firestore.scanner import discover_active_subtrials, scan_subtrial_documents
+from cron_job.services.firestore.writeback import (
     build_selected_image_prefixes,
     read_selected_image_rows,
     write_back_inference_results,
     write_back_preprocessing_status,
 )
-from cron_job.inference_client import run_inference
+from cron_job.services.inference import run_inference
 from cron_job.middleware.logger import get_logger
-from cron_job.models import (
+from cron_job.schemas.models import (
     CanonicalTrait,
     ExtractionRunResult,
     InferenceJobResult,
@@ -36,10 +36,10 @@ from cron_job.models import (
     SubtrialInfo,
     SubtrialState,
 )
-from cron_job.preprocessor_client import run_preprocessing, selected_shards_from_firestore
-from cron_job.protocol_trait_resolver import group_documents_by_protocol_trait, inference_trait_type
-from cron_job.trait_extractor import CloudRunJobClient, run_classical_extractions, run_cv_extractions
-from cron_job.gcs_client import download_text, list_blob_uris, parse_gcs_uri
+from cron_job.services.preprocessor import run_preprocessing, selected_shards_from_firestore
+from cron_job.services.utils.protocol_trait import group_documents_by_protocol_trait, inference_trait_type
+from cron_job.services.trait_extractor import CloudRunJobClient, run_classical_extractions, run_cv_extractions
+from cron_job.services.gcs import download_text, list_blob_uris, parse_gcs_uri
 
 
 def _utc_now() -> datetime:
@@ -71,6 +71,20 @@ def _parse_date(value: str) -> date:
         return date.fromisoformat(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError("date must be YYYY-MM-DD") from exc
+
+
+def _parse_dates(value: str) -> list[date]:
+    """Parse a delimited list of dates (YYYY-MM-DD). Accepts + or ; as separators."""
+    parts = [p.strip() for p in re.split(r"[+;]+", value) if p.strip()]
+    dates: list[date] = []
+    for part in parts:
+        try:
+            dates.append(date.fromisoformat(part))
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"each date must be YYYY-MM-DD, got: {part!r}") from exc
+    if not dates:
+        raise argparse.ArgumentTypeError("at least one date is required")
+    return dates
 
 
 def _slug(value: str, *, max_len: int = 80) -> str:
@@ -536,20 +550,6 @@ def _process_classical_path(
     if not docs.classical_documents:
         return "not_applicable"
 
-    state.classical_csv_uri = upload_classical_csv(
-        storage_client,
-        bucket_name=config.selected_images_bucket,
-        run_id=context.run_id,
-        run_date=str(context.utc_date),
-        trial_id=subtrial.trial_id,
-        subtrial_id=subtrial.subtrial_id,
-        documents=docs.classical_documents,
-        logger=logger,
-    )
-    if not state.classical_csv_uri:
-        state.failed_stage = state.failed_stage or "csv_upload"
-        return "failed"
-
     groups = group_documents_by_protocol_trait(
         docs.classical_documents,
         logger,
@@ -578,32 +578,57 @@ def _process_classical_path(
             errors="flowering classical extraction has no planting_date in trial/subtrial/layout data",
         )
 
-    extraction_results = run_classical_extractions(
-        config,
-        db=db,
-        cloud_run_client=cloud_run_client,
-        run_id=context.run_id,
-        subtrial_id=subtrial.subtrial_id,
-        input_csv=state.classical_csv_uri,
-        groups=groups,
-        planting_date=planting_date,
-        logger=logger,
-    )
-    csv_ok = True
-    # csv-writeback disabled — the trait extraction service handles output location
-    # csv_ok = write_back_csv(
-    #     storage_client,
-    #     raw_csv_uri=state.classical_csv_uri,
-    #     extraction_results=extraction_results,
-    #     csv_type="classical",
-    #     logger=logger,
-    #     trial_id=subtrial.trial_id,
-    #     subtrial_id=subtrial.subtrial_id,
-    # )
+    # Upload a separate CSV per trait group and run extraction for each
+    docs_by_id = {doc.document_id: doc for doc in docs.classical_documents}
+    extraction_results: list[ExtractionRunResult] = []
+    for group in groups:
+        group_docs = [docs_by_id[did] for did in group.source_document_ids if did in docs_by_id]
+        if not group_docs:
+            continue
+        group_csv_uri = upload_classical_csv(
+            storage_client,
+            bucket_name=config.selected_images_bucket,
+            run_id=context.run_id,
+            run_date=str(context.utc_date),
+            trial_id=subtrial.trial_id,
+            subtrial_id=subtrial.subtrial_id,
+            documents=group_docs,
+            logger=logger,
+        )
+        if not group_csv_uri:
+            logger.log(
+                "classical_path",
+                "warning",
+                trial_id=subtrial.trial_id,
+                subtrial_id=subtrial.subtrial_id,
+                trait=group.canonical_trait_name,
+                errors="csv upload failed for trait group",
+            )
+            continue
+        # Store the first uploaded URI for state tracking
+        if not state.classical_csv_uri:
+            state.classical_csv_uri = group_csv_uri
+        group_results = run_classical_extractions(
+            config,
+            db=db,
+            cloud_run_client=cloud_run_client,
+            run_id=context.run_id,
+            subtrial_id=subtrial.subtrial_id,
+            input_csv=group_csv_uri,
+            groups=[group],
+            planting_date=planting_date,
+            logger=logger,
+        )
+        extraction_results.extend(group_results)
+
+    if not extraction_results:
+        state.failed_stage = state.failed_stage or "csv_upload"
+        return "failed"
+
     status = _path_status_from_results(
         expected_count=len(groups),
         extraction_results=extraction_results,
-        csv_writeback_success=csv_ok,
+        csv_writeback_success=True,
     )
     if status in {"failed", "completed_with_errors"}:
         state.failed_stage = state.failed_stage or "classical"
@@ -1263,7 +1288,369 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Filter by data_collection date (YYYY-MM-DD) instead of upload_timestamp. Mutually exclusive with --run-date.",
     )
+    parser.add_argument(
+        "--data-collected-dates",
+        type=_parse_dates,
+        default=None,
+        help="Comma-separated list of data_collection dates (YYYY-MM-DD). Processes scan/csv/preprocess/inference per-date, then runs trait extraction once for all dates combined.",
+    )
     return parser.parse_args(argv)
+
+
+def _process_multi_date(
+    config: AppConfig,
+    *,
+    db,
+    storage_client,
+    cloud_run_client: CloudRunJobClient,
+    context: RunContext,
+    subtrial: SubtrialInfo,
+    dates: list[date],
+    logger,
+) -> SubtrialState:
+    """Process multiple dates: scan/csv/preprocess/inference per-date, then trait extraction once for all."""
+    state = SubtrialState(
+        trial_id=subtrial.trial_id,
+        subtrial_id=subtrial.subtrial_id,
+        index=0,
+        batch_run_id=_batch_run_id(context.run_id, 0, subtrial.subtrial_id),
+    )
+    logger.log(
+        "multi_date",
+        "started",
+        trial_id=subtrial.trial_id,
+        subtrial_id=subtrial.subtrial_id,
+        dates=[d.isoformat() for d in dates],
+        date_count=len(dates),
+    )
+
+    all_inference_results: list[InferenceJobResult] = []
+    all_classical_documents: list[ScannedDocument] = []
+    per_date_errors: list[str] = []
+
+    for date_index, dc_date in enumerate(dates):
+        dc_date_str = dc_date.isoformat()
+        logger.log(
+            "multi_date_phase1",
+            "started",
+            trial_id=subtrial.trial_id,
+            subtrial_id=subtrial.subtrial_id,
+            data_collected_date=dc_date_str,
+            date_index=date_index + 1,
+            date_total=len(dates),
+        )
+
+        try:
+            docs = scan_subtrial_documents(
+                db, subtrial, context.utc_date, logger, data_collected_date=dc_date_str
+            )
+
+            if not docs.image_documents and not docs.classical_documents:
+                logger.log(
+                    "multi_date_phase1",
+                    "skipped" if not docs.scan_errors else "failed",
+                    trial_id=subtrial.trial_id,
+                    subtrial_id=subtrial.subtrial_id,
+                    data_collected_date=dc_date_str,
+                    image_document_count=0,
+                    classical_document_count=0,
+                    scan_error_count=len(docs.scan_errors),
+                )
+                if docs.scan_errors:
+                    per_date_errors.append(f"{dc_date_str}: scan errors")
+                continue
+
+            # Collect classical documents for combined extraction later
+            all_classical_documents.extend(docs.classical_documents)
+
+            # --- CV path: scan → csv → preprocess → inference (per-date) ---
+            if docs.image_documents:
+                # Split documents by protocol and upload separate CSVs
+                docs_by_protocol: dict[str, list[ScannedDocument]] = {}
+                for doc in docs.image_documents:
+                    protocol = doc.protocol or "unknown"
+                    docs_by_protocol.setdefault(protocol, []).append(doc)
+
+                uploaded_uris: list[str] = []
+                for protocol, protocol_docs in docs_by_protocol.items():
+                    protocol_slug = _slug(protocol, max_len=60)
+                    uri = upload_csv(
+                        storage_client,
+                        bucket_name=config.gcs_bucket,
+                        run_id=context.run_id,
+                        trial_id=subtrial.trial_id,
+                        subtrial_id=subtrial.subtrial_id,
+                        csv_type=f"images_{protocol_slug}_{dc_date_str}",
+                        documents=protocol_docs,
+                        logger=logger,
+                        raw_prefix_root=config.raw_prefix_root,
+                    )
+                    if uri:
+                        uploaded_uris.append(uri)
+
+                if not uploaded_uris:
+                    per_date_errors.append(f"{dc_date_str}: csv upload failed")
+                    logger.log(
+                        "multi_date_phase1",
+                        "failed",
+                        trial_id=subtrial.trial_id,
+                        subtrial_id=subtrial.subtrial_id,
+                        data_collected_date=dc_date_str,
+                        errors="csv upload failed",
+                    )
+                    continue
+
+                date_batch_run_id = f"{context.run_id}-{date_index:03d}-{dc_date_str}"
+                preprocessing = run_preprocessing(
+                    config,
+                    db=db,
+                    image_csv_uri=uploaded_uris[0],
+                    batch_run_id=date_batch_run_id,
+                    logger=logger,
+                )
+
+                if not preprocessing.success:
+                    per_date_errors.append(f"{dc_date_str}: preprocessing failed")
+                    logger.log(
+                        "multi_date_phase1",
+                        "failed",
+                        trial_id=subtrial.trial_id,
+                        subtrial_id=subtrial.subtrial_id,
+                        data_collected_date=dc_date_str,
+                        errors="preprocessing failed",
+                    )
+                    continue
+
+                selected_rows = read_selected_image_rows(storage_client, preprocessing.selected_shard_uris)
+                selected_ids, prefixes_by_doc_id = build_selected_image_prefixes(
+                    image_documents=docs.image_documents,
+                    selected_rows_by_image_id=selected_rows,
+                    selected_images_bucket=config.selected_images_bucket,
+                )
+                write_back_preprocessing_status(
+                    db,
+                    image_documents=docs.image_documents,
+                    selected_image_ids=selected_ids,
+                    preprocessing_success=True,
+                    batch_run_id=preprocessing.batch_run_id,
+                    run_id=context.run_id,
+                    logger=logger,
+                    trial_id=subtrial.trial_id,
+                    subtrial_id=subtrial.subtrial_id,
+                )
+
+                selected_docs = _selected_image_docs(
+                    docs.image_documents,
+                    selected_ids,
+                    prefixes_by_doc_id,
+                    logger,
+                    trial_id=subtrial.trial_id,
+                    subtrial_id=subtrial.subtrial_id,
+                )
+                if not selected_docs:
+                    logger.log(
+                        "multi_date_phase1",
+                        "skipped",
+                        trial_id=subtrial.trial_id,
+                        subtrial_id=subtrial.subtrial_id,
+                        data_collected_date=dc_date_str,
+                        errors="no selected images after preprocessing",
+                    )
+                    continue
+
+                groups = group_documents_by_protocol_trait(
+                    selected_docs,
+                    logger,
+                    trial_id=subtrial.trial_id,
+                    subtrial_id=subtrial.subtrial_id,
+                    image_prefixes_by_document_id=prefixes_by_doc_id,
+                )
+                groups = [group for group in groups if group.image_prefixes]
+                if not groups:
+                    per_date_errors.append(f"{dc_date_str}: no valid protocol/trait groups")
+                    continue
+
+                inference_results = run_inference(
+                    config,
+                    run_id=context.run_id,
+                    subtrial_id=subtrial.subtrial_id,
+                    groups=groups,
+                    logger=logger,
+                )
+                write_back_inference_results(
+                    db,
+                    image_documents=selected_docs,
+                    inference_results=inference_results,
+                    run_id=context.run_id,
+                    logger=logger,
+                    trial_id=subtrial.trial_id,
+                    subtrial_id=subtrial.subtrial_id,
+                )
+
+                successful = [r for r in inference_results if r.success]
+                all_inference_results.extend(successful)
+
+                logger.log(
+                    "multi_date_phase1",
+                    "success",
+                    trial_id=subtrial.trial_id,
+                    subtrial_id=subtrial.subtrial_id,
+                    data_collected_date=dc_date_str,
+                    image_document_count=len(docs.image_documents),
+                    classical_document_count=len(docs.classical_documents),
+                    inference_success_count=len(successful),
+                )
+            else:
+                logger.log(
+                    "multi_date_phase1",
+                    "success",
+                    trial_id=subtrial.trial_id,
+                    subtrial_id=subtrial.subtrial_id,
+                    data_collected_date=dc_date_str,
+                    image_document_count=0,
+                    classical_document_count=len(docs.classical_documents),
+                )
+
+        except Exception as exc:
+            per_date_errors.append(f"{dc_date_str}: {exc}")
+            logger.log_exception(
+                "multi_date_phase1",
+                "failed",
+                exc,
+                trial_id=subtrial.trial_id,
+                subtrial_id=subtrial.subtrial_id,
+                data_collected_date=dc_date_str,
+            )
+            continue
+
+    # --- Phase 2: Combined trait extraction ---
+    logger.log(
+        "multi_date_phase2",
+        "started",
+        trial_id=subtrial.trial_id,
+        subtrial_id=subtrial.subtrial_id,
+        total_inference_results=len(all_inference_results),
+        total_classical_documents=len(all_classical_documents),
+    )
+
+    planting_date = _extract_planting_date(subtrial)
+
+    # CV extraction: all inference results combined
+    if all_inference_results:
+        cv_extraction_results = run_cv_extractions(
+            config,
+            db=db,
+            cloud_run_client=cloud_run_client,
+            run_id=context.run_id,
+            subtrial_id=subtrial.subtrial_id,
+            inference_results=all_inference_results,
+            logger=logger,
+            planting_date=planting_date,
+        )
+        cv_success = bool(cv_extraction_results) and any(r.success for r in cv_extraction_results)
+        state.cv_path_status = "succeeded" if cv_success else "failed"
+        logger.log(
+            "multi_date_phase2",
+            "success" if cv_success else "failed",
+            trial_id=subtrial.trial_id,
+            subtrial_id=subtrial.subtrial_id,
+            path="cv",
+            extraction_count=len(cv_extraction_results),
+            successful_count=sum(1 for r in cv_extraction_results if r.success),
+        )
+    else:
+        state.cv_path_status = "not_applicable"
+
+    # Classical extraction: one CSV per trait group for all dates combined
+    if all_classical_documents:
+        groups = group_documents_by_protocol_trait(
+            all_classical_documents,
+            logger,
+            trial_id=subtrial.trial_id,
+            subtrial_id=subtrial.subtrial_id,
+        )
+        if groups:
+            docs_by_id = {doc.document_id: doc for doc in all_classical_documents}
+            classical_extraction_results: list[ExtractionRunResult] = []
+            for group in groups:
+                group_docs = [docs_by_id[did] for did in group.source_document_ids if did in docs_by_id]
+                if not group_docs:
+                    continue
+                group_csv_uri = upload_classical_csv(
+                    storage_client,
+                    bucket_name=config.selected_images_bucket,
+                    run_id=context.run_id,
+                    run_date=str(context.utc_date),
+                    trial_id=subtrial.trial_id,
+                    subtrial_id=subtrial.subtrial_id,
+                    documents=group_docs,
+                    logger=logger,
+                )
+                if not group_csv_uri:
+                    logger.log(
+                        "multi_date_phase2",
+                        "warning",
+                        trial_id=subtrial.trial_id,
+                        subtrial_id=subtrial.subtrial_id,
+                        trait=group.canonical_trait_name,
+                        errors="csv upload failed for trait group",
+                    )
+                    continue
+                group_results = run_classical_extractions(
+                    config,
+                    db=db,
+                    cloud_run_client=cloud_run_client,
+                    run_id=context.run_id,
+                    subtrial_id=subtrial.subtrial_id,
+                    input_csv=group_csv_uri,
+                    groups=[group],
+                    planting_date=planting_date,
+                    logger=logger,
+                )
+                classical_extraction_results.extend(group_results)
+
+            if classical_extraction_results:
+                classical_success = any(r.success for r in classical_extraction_results)
+                state.classical_path_status = "succeeded" if classical_success else "failed"
+                logger.log(
+                    "multi_date_phase2",
+                    "success" if classical_success else "failed",
+                    trial_id=subtrial.trial_id,
+                    subtrial_id=subtrial.subtrial_id,
+                    path="classical",
+                    extraction_count=len(classical_extraction_results),
+                    successful_count=sum(1 for r in classical_extraction_results if r.success),
+                )
+            else:
+                state.classical_path_status = "failed"
+                state.failed_stage = "csv_upload"
+        else:
+            state.classical_path_status = "failed"
+            state.failed_stage = "protocol_trait_resolution"
+    else:
+        state.classical_path_status = "not_applicable"
+
+    # Final status
+    has_failures = bool(per_date_errors) or state.cv_path_status == "failed" or state.classical_path_status == "failed"
+    has_successes = state.cv_path_status == "succeeded" or state.classical_path_status == "succeeded"
+    if has_failures and has_successes:
+        state.status = "succeeded"  # partial success — some dates may have failed but extraction worked
+    elif has_successes:
+        state.status = "succeeded"
+    else:
+        state.status = "failed"
+
+    logger.log(
+        "multi_date",
+        state.status,
+        trial_id=subtrial.trial_id,
+        subtrial_id=subtrial.subtrial_id,
+        dates=[d.isoformat() for d in dates],
+        per_date_errors=per_date_errors,
+        cv_path_status=state.cv_path_status,
+        classical_path_status=state.classical_path_status,
+    )
+    return state
 
 
 def run(argv: Sequence[str] | None = None) -> int:
@@ -1313,6 +1700,26 @@ def run(argv: Sequence[str] | None = None) -> int:
 
         cloud_run_client = CloudRunJobClient(config)
 
+        # --- Multi-date mode ---
+        if args.data_collected_dates:
+            trial_id = _require(args.trial_id, "--trial-id")
+            subtrial_id = _require(args.subtrial_id, "--subtrial-id")
+            subtrial = _load_subtrial_info(db, trial_id, subtrial_id)
+            state = _process_multi_date(
+                config,
+                db=db,
+                storage_client=storage_client,
+                cloud_run_client=cloud_run_client,
+                context=context,
+                subtrial=subtrial,
+                dates=args.data_collected_dates,
+                logger=logger,
+            )
+            failed = state.status == "failed"
+            logger.log("summary", "failed" if failed else "succeeded", run_id=context.run_id, subtrial_status=state.status)
+            return 1 if failed else 0
+
+        # --- Single-date / discovery mode ---
         subtrials = _select_subtrials(db, args, logger)
         states: list[SubtrialState] = []
         for index, subtrial in enumerate(subtrials, start=1):

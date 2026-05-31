@@ -14,10 +14,12 @@
 | Area | Final design decision |
 |---|---|
 | Job exit code | `0` only when all processed subtrials succeed or no active trials exist. `1` when at least one subtrial fails or when a fatal bootstrap/discovery error occurs. |
-| Batch run ID | `<run_id>-<subtrial_id>-images` for the Images CSV preprocessing path. |
-| CSV model | Two CSVs per subtrial: `{subtrial_id}_images.csv` and `{subtrial_id}_classical.csv`. |
+| Batch run ID | `<run_id>-<subtrial_id>-images` for the Images CSV preprocessing path. In multi-date mode, batch IDs are date-suffixed: `<run_id>-<date_index>-<YYYY-MM-DD>`. |
+| CSV model | Two CSVs per subtrial: `{subtrial_id}_images.csv` and **one classical CSV per trait group** (e.g. one for flowering, one for pods, one for plantstand). Single-CSV-for-all-traits is no longer supported because the downstream trait extraction service rejects mixed protocol/data_type CSVs. |
 | Inference fan-out | Dynamic, driven by unique `(protocol, trait)` groups derived from image documents. Do not hardcode three inference jobs. |
-| Classical fan-out | Dynamic, driven by unique `(protocol, trait)` groups derived from classical documents. |
+| Classical fan-out | Dynamic, driven by unique `(protocol, trait)` groups derived from classical documents. Each group gets its own filtered CSV upload before extraction. |
+| Date selection | Three mutually-relevant flags. Precedence: `--data-collected-dates` > `--data-collected-date` > `--run-date`. See section 2.5.1. |
+| Multi-date mode | When `--data-collected-dates` is supplied, scan/csv/preprocess/inference run per-date in phase 1, then trait extraction runs once in phase 2 with combined inference results and per-trait classical CSVs covering all dates. |
 | `data_collections` | Stub only. Function exists but returns `[]`; it is not actively scanned. |
 | CSV leading columns | `collection_name`, `document_id`, `image_uri`, `protocol`, `trait`, followed by sorted dynamic metadata fields. |
 | Firestore write-back | Best effort only. Write-back failures are logged but do not change subtrial status or job exit code. |
@@ -90,7 +92,7 @@ The Daily Pipeline Cron Job is a scheduled GCP batch orchestrator that:
 
 ## 2.3 Non-goals
 
-- This job does not replace the existing preprocessor, inference service, or trait extraction CLI.
+- This job does not replace the existing preprocessor, inference service, or trait extraction Cloud Run Job.
 - This job does not own ML model lifecycle, model versioning, or training.
 - This job does not provide an end-user UI.
 - This job does not persist a canonical pipeline run registry in Firestore unless the optional audit schema is added.
@@ -106,37 +108,56 @@ The Daily Pipeline Cron Job is a scheduled GCP batch orchestrator that:
 | GCS bucket `ona-harvest` | Stores raw CSVs, inference artifacts, extraction outputs, and optionally manifests. |
 | `e2e_prerops` | Preprocesses image CSV data and determines selected/rejected/skipped images. |
 | `ona-infer` | Runs asynchronous batch inference jobs for unique image protocol-trait groups. |
-| Trait extraction CLI | Produces derived trait outputs for CV and classical paths. |
+| Trait extraction Cloud Run Job (`ona-trait-extraction`) | Produces derived trait outputs for CV and classical paths. Invoked via the Cloud Run Jobs API with an inline run-spec. |
 | Cloud Logging | Stores structured run, stage, and failure logs. |
 | Secret Manager | Supplies runtime secrets where needed. |
 
 ## 2.5 High-level execution flow
 
-1. Scheduler invokes the Cloud Run Job.
+1. Scheduler invokes the Cloud Run Job (or it is triggered manually with `gcloud run jobs execute`).
 2. Job generates `run_id` before any environment validation.
 3. Job loads configuration and initializes clients.
-4. Job discovers active trials and subtrials.
-5. For each subtrial, sequentially:
-   - Scan today's documents.
-   - Split image vs classical documents.
-   - Create and upload zero, one, or two CSVs.
-   - If an Images CSV exists:
-     - Trigger preprocessing.
-     - Poll until terminal state.
-     - Write preprocessing state back to Firestore image docs.
-     - Resolve protocol-trait groups.
-     - Submit inference jobs concurrently, one per valid group.
-     - Poll each job independently.
-     - Write successful inference result metadata back to Firestore image docs.
-     - Run CV extraction once per unique successful inference output path.
-     - Merge CV extraction results into the Images CSV.
-   - If a Classical CSV exists:
-     - Resolve protocol-trait groups.
-     - Run classical extraction once per valid group.
-     - Merge results into the Classical CSV.
-   - Record subtrial outcome.
-6. Emit final summary.
-7. Exit `0` or `1` according to final outcome.
+4. Job parses the date selection flag (see 2.5.1).
+5. Single-date mode (default): Job discovers active trials and subtrials.
+   - For each subtrial, sequentially:
+     - Scan today's documents.
+     - Split image vs classical documents.
+     - Create and upload zero, one, or two CSVs (images + per-trait classical).
+     - If an Images CSV exists:
+       - Trigger preprocessing.
+       - Poll until terminal state.
+       - Write preprocessing state back to Firestore image docs.
+       - Resolve protocol-trait groups.
+       - Submit inference jobs concurrently, one per valid group.
+       - Poll each job independently.
+       - Write successful inference result metadata back to Firestore image docs.
+       - Run CV extraction once per unique successful inference output path.
+     - If Classical documents exist:
+       - Resolve protocol-trait groups.
+       - For each group, upload a filtered classical CSV containing only that group's documents.
+       - Run classical extraction once per group with that group's CSV.
+     - Record subtrial outcome.
+6. Multi-date mode (`--data-collected-dates` supplied): Job loads the single supplied subtrial.
+   - **Phase 1 (per-date, sequential):** For each date:
+     - Scan documents matching that `data_collection` date.
+     - Upload date-suffixed CV CSVs and run preprocessing + inference.
+     - Accumulate successful inference results into a single combined list.
+     - Accumulate classical documents into a single combined list.
+   - **Phase 2 (combined, once):**
+     - Run CV extraction with the combined inference results across all dates. Deduplication by `(canonical_trait, output_gcs_path)` is preserved.
+     - Group the combined classical documents. For each trait group, upload one combined classical CSV (covering all dates) and run classical extraction with that group's CSV.
+7. Emit final summary.
+8. Exit `0` or `1` according to final outcome.
+
+### 2.5.1 Date selection flags and precedence
+
+Three flags are accepted. Precedence (highest first):
+
+1. `--data-collected-dates` — multi-date mode, `+`-delimited list of `YYYY-MM-DD` values.
+2. `--data-collected-date` — single date, filters Firestore by the `data_collection` string field.
+3. `--run-date` — single date, filters Firestore by the `upload_timestamp` UTC window. Defaults to today when nothing else is supplied.
+
+The `+` separator is required in `--data-collected-dates` because Cloud Run splits `--args` on commas. Internally `_parse_dates` accepts `+` or `;` as separators.
 
 ## 2.6 Processing topology
 
@@ -155,7 +176,19 @@ The Daily Pipeline Cron Job is a scheduled GCP batch orchestrator that:
   - One async job per unique valid image protocol-trait group.
   - Independent polling for each submitted inference job.
 
-### 2.6.2 Failure boundaries
+- **Per-trait classical CSV uploads**
+  - One CSV per `(protocol, trait)` group, filtered to that group's source documents only.
+  - Required because the trait extraction service rejects CSVs containing mixed protocols or data types.
+
+### 2.6.2 Multi-date topology
+
+When `--data-collected-dates` is supplied:
+
+- Phase 1 runs date-by-date sequentially. Each date executes scan, csv upload, preprocessing, and inference in isolation. A failure in one date is logged and the loop proceeds to the next date.
+- Phase 2 runs once after phase 1 completes. CV extraction receives the combined list of successful inference results (deduplication via `seen` set is preserved). Classical extraction uploads one CSV per trait group with all dates' documents combined, then triggers extraction per group.
+- Throughput benefit: downstream services (preprocessor, ona-infer) still see one date's payload at a time. Trait extraction sees the union, which is acceptable because it is the terminal step and benefits from batching.
+
+### 2.6.3 Failure boundaries
 
 | Failure type | Failure scope | Continue? | Affects job exit? |
 |---|---|---:|---:|
@@ -164,9 +197,13 @@ The Daily Pipeline Cron Job is a scheduled GCP batch orchestrator that:
 | Discovery query failure | Entire job | No | Yes |
 | One sub-collection scan failure | That collection only | Yes | Usually no, unless policy marks degraded scan as failure |
 | One CSV upload failure | That pipeline path | Other path continues | Yes if subtrial considered failed |
+| Per-trait classical CSV upload failure | That trait group only | Other trait groups continue | Subtrial path failure if all groups fail |
 | Preprocessor failure | CV path | Classical continues | Yes |
 | One inference group failure | That group | Remaining groups continue | Recommended yes |
 | One extraction group failure | That group | Remaining groups continue | Recommended yes |
+| One date in multi-date phase 1 | That date only | Remaining dates continue; phase 2 still runs with what succeeded | Subtrial succeeds if any date contributed extractable results |
+| Missing classical metadata fields (`project_name`, `site_name`, `trial_name`, `season`, `field`, `location`) | Classical CSV upload returns `None` for that trait group | Other trait groups continue | Yes if all trait groups fail upload |
+| Missing `data_collection` field on documents (in date-filter mode) | Documents silently excluded for that date | Yes | No crash; date may yield zero documents |
 | CSV write-back failure | That pipeline path | Other write-back still attempted | Yes |
 | Firestore write-back failure | Write-back only | Yes | No |
 
@@ -225,36 +262,36 @@ flowchart LR
 
     JOB --> PRE[e2e_prerops\nPreprocessor Service]
     JOB --> INF[ona-infer\nBatch Inference Service]
-    JOB --> EXT[Trait Extraction CLI\nsubprocess in Job container]
+    JOB --> EXT[ona-trait-extraction\nCloud Run Job]
 ```
 
 ## 3.2 Component architecture
 
 ```mermaid
 flowchart TD
-    MAIN[main.py\nOrchestrator] --> CFG[config/bootstrap]
-    MAIN --> DISC[firestore_client.py\nDiscovery + Scanning]
-    MAIN --> CSV[csv_assembler.py]
-    MAIN --> GCS[gcs_client.py]
-    MAIN --> PRE[preprocessor_client.py]
-    MAIN --> PTR[protocol_trait_resolver.py]
-    MAIN --> INF[inference_client.py]
-    MAIN --> EXT[trait_extractor.py]
-    MAIN --> WB[csv_writeback.py]
-    MAIN --> FSWB[firestore_writeback.py]
-    MAIN --> LOG[logger.py]
+    MAIN[main.py\nOrchestrator] --> CFG[core/config.py]
+    MAIN --> DISC[services/firestore/scanner.py\nDiscovery + Scanning]
+    MAIN --> CSV[services/csv/assembler.py]
+    MAIN --> GCS[services/gcs.py]
+    MAIN --> PRE[services/preprocessor.py]
+    MAIN --> PTR[services/utils/protocol_trait.py]
+    MAIN --> INF[services/inference.py]
+    MAIN --> EXT[services/trait_extractor.py]
+    MAIN --> WB[services/csv/writeback.py]
+    MAIN --> FSWB[services/firestore/writeback.py]
+    MAIN --> LOG[middleware/logger.py]
 
     DISC --> FS[(Firestore)]
     CSV --> GCS
     GCS --> OBJ[(GCS Objects)]
     PRE --> PP[e2e_prerops]
     INF --> OI[ona-infer]
-    EXT --> CLI[Trait Extraction CLI]
+    EXT --> CRJ[ona-trait-extraction Cloud Run Job]
     FSWB --> FS
     LOG --> CL[Cloud Logging]
 ```
 
-## 3.3 Per-subtrial orchestration flow
+## 3.3 Per-subtrial orchestration flow (single-date mode)
 
 ```mermaid
 flowchart TD
@@ -265,7 +302,7 @@ flowchart TD
 
     D --> ICSV{Image docs exist?}
     ICSV -->|No| ISKIP[Skip CV path]
-    ICSV -->|Yes| I1[Create + upload Images CSV]
+    ICSV -->|Yes| I1[Create + upload Images CSV per protocol]
     I1 --> I2{Upload OK?}
     I2 -->|No| IF[CV path failed]
     I2 -->|Yes| I3[Start preprocessing]
@@ -277,26 +314,53 @@ flowchart TD
     I8 --> I9[Poll inference jobs independently]
     I9 --> I10[Write successful inference metadata to Firestore]
     I10 --> I11[Run CV extraction per unique output path]
-    I11 --> I12[Merge extraction results into Images CSV]
 
     D --> CCSV{Classical docs exist?}
     CCSV -->|No| CSKIP[Skip classical path]
-    CCSV -->|Yes| C1[Create + upload Classical CSV]
-    C1 --> C2{Upload OK?}
+    CCSV -->|Yes| C0[Resolve classical protocol-trait groups]
+    C0 --> C1[For each group: filter docs + upload trait-specific CSV]
+    C1 --> C2{Any group CSV uploaded?}
     C2 -->|No| CF[Classical path failed]
-    C2 -->|Yes| C3[Resolve classical protocol-trait groups]
-    C3 --> C4[Run classical extraction per group]
-    C4 --> C5[Merge extraction results into Classical CSV]
+    C2 -->|Yes| C4[Run classical extraction per group with its own CSV]
 
     ISKIP --> END[Finalize Subtrial Status]
     IF --> END
     I5 --> END
-    I12 --> END
+    I11 --> END
     CSKIP --> END
     CF --> END
-    C5 --> END
+    C4 --> END
     Z --> DONE[Continue Next Subtrial]
     END --> DONE
+```
+
+## 3.3.1 Multi-date orchestration flow
+
+```mermaid
+flowchart TD
+    M0[Start Multi-Date Run] --> M1[Load single subtrial]
+    M1 --> P1[Phase 1: per-date loop]
+
+    P1 --> D1[Scan docs for date N]
+    D1 --> D2{Any docs?}
+    D2 -->|No| D9[Skip this date]
+    D2 -->|Yes| D3[Upload date-suffixed images CSV]
+    D3 --> D4[Run preprocessing for date N]
+    D4 --> D5{Preprocess OK?}
+    D5 -->|No| D9
+    D5 -->|Yes| D6[Run inference for date N]
+    D6 --> D7[Append successful inference results to combined list]
+    D7 --> D8[Append classical docs to combined list]
+    D8 --> DN{More dates?}
+    D9 --> DN
+    DN -->|Yes| D1
+    DN -->|No| P2[Phase 2: combined extraction]
+
+    P2 --> P3[Run CV extraction with combined inference results]
+    P3 --> P4[Group combined classical docs by protocol-trait]
+    P4 --> P5[For each trait group: filter docs + upload combined classical CSV]
+    P5 --> P6[Run classical extraction per group]
+    P6 --> P7[Finalize subtrial status]
 ```
 
 ## 3.4 CV pipeline sequence
@@ -304,14 +368,14 @@ flowchart TD
 ```mermaid
 sequenceDiagram
     participant M as main.py
-    participant CSV as csv_assembler.py
+    participant CSV as services/csv/assembler.py
     participant G as GCS
     participant P as e2e_prerops
-    participant R as protocol_trait_resolver.py
-    participant I as inference_client.py
+    participant R as services/utils/protocol_trait.py
+    participant I as services/inference.py
     participant O as ona-infer
-    participant E as trait_extractor.py
-    participant W as csv_writeback.py
+    participant E as services/trait_extractor.py
+    participant W as services/csv/writeback.py
     participant F as Firestore
 
     M->>CSV: assemble_images_csv(image_docs)
@@ -361,27 +425,23 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant M as main.py
-    participant CSV as csv_assembler.py
+    participant R as services/utils/protocol_trait.py
+    participant CSV as services/csv/assembler.py
     participant G as GCS
-    participant R as protocol_trait_resolver.py
-    participant E as trait_extractor.py
-    participant W as csv_writeback.py
-
-    M->>CSV: assemble_classical_csv(classical_docs)
-    CSV->>G: upload classical CSV
-    G-->>CSV: classical_csv_uri
-    CSV-->>M: classical_csv_uri
+    participant E as services/trait_extractor.py
 
     M->>R: resolve classical protocol-trait groups
     R-->>M: valid groups
 
     loop each group
-        M->>E: run classical extraction(input_csv)
+        M->>M: filter docs to group source_document_ids
+        M->>CSV: upload_classical_csv(filtered_docs)
+        CSV->>G: upload trait-specific classical CSV
+        G-->>CSV: group_classical_csv_uri
+        CSV-->>M: group_classical_csv_uri
+        M->>E: run classical extraction with this group's CSV
         E-->>M: extraction result
     end
-
-    M->>W: merge extraction results into Classical CSV
-    W->>G: overwrite enriched classical CSV
 ```
 
 ## 3.6 Deployment and IAM view
@@ -401,61 +461,100 @@ flowchart LR
 
 # 4. Low-Level Design
 
-## 4.1 Suggested package structure
+## 4.1 Package structure
+
+The current implementation uses a layered structure that groups files by responsibility. Empty placeholder modules from earlier scaffolding have been removed.
 
 ```text
 cron_job/
 |-- __init__.py
-|-- main.py
-|-- config.py
-|-- logger.py
-|-- firestore_client.py
-|-- csv_assembler.py
-|-- gcs_client.py
-|-- preprocessor_client.py
-|-- protocol_trait_resolver.py
-|-- inference_client.py
-|-- trait_extractor.py
-|-- csv_writeback.py
-|-- firestore_writeback.py
-|-- errors.py
-|-- models.py
+|-- main.py                          # CLI entrypoint, argparse, run() router
 |-- Dockerfile
+|-- cloudbuild.yaml
 |-- requirements.txt
-|-- README.md
+|-- core/
+|   `-- config.py                    # AppConfig + load_config from environment
+|-- db/
+|   |-- firestore.py                 # Firestore admin client bootstrap
+|   `-- gstorage.py                  # GCS client bootstrap
+|-- middleware/
+|   |-- logger.py                    # StructuredLogger emitting JSON to Cloud Logging
+|   `-- logging.py
+|-- schemas/
+|   |-- models.py                    # Dataclasses: RunContext, SubtrialInfo, ScannedDocument,
+|   |                                #             ProtocolTraitGroup, PreprocessorResult,
+|   |                                #             InferenceJobResult, ExtractionRunResult, SubtrialState
+|   |-- image.py
+|   `-- plot.py
+|-- services/
+|   |-- gcs.py                       # GCS URI/bytes helpers
+|   |-- preprocessor.py              # e2e_prerops HTTP adapter
+|   |-- inference.py                 # ona-infer HTTP adapter (concurrent submission + polling)
+|   |-- trait_extractor.py           # Cloud Run Job adapter for ona-trait-extraction
+|   |-- csv/
+|   |   |-- assembler.py             # CSV row/header assembly + raw uploads
+|   |   `-- writeback.py             # CSV merge of extraction outputs onto raw CSV
+|   |-- firestore/
+|   |   |-- scanner.py               # Discovery + per-subtrial document scanning
+|   |   `-- writeback.py             # Per-doc preprocessing/inference field writes
+|   `-- utils/
+|       `-- protocol_trait.py        # Trait keyword resolver and group assembly
+|-- docs/
+|   |-- daily_pipeline_design_pack.md
+|   |-- daily_pipeline_mermaid_diagrams.md
+|   |-- LOCAL_TESTING_AND_DEPLOYMENT.md
+|   `-- PLAN.md
 `-- tests/
-    |-- __init__.py
-    |-- conftest.py
-    |-- test_logger.py
-    |-- test_firestore_client.py
+    |-- conftest.py                  # CaptureLogger, app_config, doc/group fixtures
+    |-- test_daily_pipeline_units.py
+    |-- test_daily_pipeline_adapters.py
     |-- test_csv_assembler.py
-    |-- test_gcs_client.py
-    |-- test_preprocessor_client.py
-    |-- test_protocol_trait_resolver.py
-    |-- test_inference_client.py
-    |-- test_trait_extractor.py
     |-- test_csv_writeback.py
+    |-- test_gcs_client.py
+    |-- test_firestore_scanner.py
     |-- test_firestore_writeback.py
-    |-- test_main.py
-    `-- test_integration.py
+    |-- test_logger.py
+    |-- test_trait_extractor.py
+    |-- test_classical_path.py
+    `-- test_multi_date_orchestration.py
 ```
 
+Notes:
+- A dedicated `errors.py` module is not used; the codebase relies on standard exceptions (`ValueError`, `RuntimeError`) and structured-logger `errors` payloads instead of custom exception classes.
+- Stages live in `main.py` rather than a separate `stages/` package; the orchestrator was kept intentionally compact.
+
 ## 4.2 Configuration model
+
+The actual `AppConfig` lives in `cron_job/core/config.py`. It is loaded from environment variables via `load_config(require_services=True)`.
 
 ```python
 @dataclass(frozen=True)
 class AppConfig:
-    firestore_project_id: str
     gcs_bucket: str
     preprocessor_url: str
     inference_url: str
-    cloud_region: str = "us-central1"
+    gcp_project_id: str
+    firestore_database_id: str = "artemis-prod"
+    gcp_run_region: str = "us-central1"
+    trait_extraction_job_id: str = "ona-trait-extraction"
+    trait_extraction_runs_collection: str = "trait_extraction_runs"
+    firebase_storage_bucket: str = "artemis-418513.firebasestorage.app"
+    raw_prefix_root: str = "raw"
+    inference_prefix_root: str = "inference"
+    extraction_prefix_root: str = "extraction"
+    selected_images_bucket: str = "artemis-revamp"
     preprocessor_poll_timeout_s: int = 3600
     preprocessor_request_timeout_s: int = 30
     preprocessor_transient_error_limit: int = 5
     inference_poll_timeout_s: int = 7200
-    extraction_subprocess_timeout_s: int = 300
-    job_timezone: str = "UTC"
+    inference_request_timeout_s: int = 60
+    trait_extraction_poll_timeout_s: int = 24 * 60 * 60
+    trait_extraction_request_timeout_s: int = 30
+    inference_confidence: float = 0.5
+    inference_limit: int = 1_000_000
+    use_cloud_logging: bool = True
+    firebase_credentials: dict[str, Any] | None = None
+    gcp_service_account_credentials: dict[str, Any] | None = None
 ```
 
 ### Configuration principles
@@ -465,6 +564,31 @@ class AppConfig:
 - Generate `run_id` before config validation.
 - Never emit secret values in logs.
 - Consider loading only secret values from Secret Manager, while non-sensitive URLs and bucket/project names remain environment variables.
+
+### CLI arguments (orchestrator entrypoint)
+
+```python
+parser.add_argument("--smoke-test", action="store_true")
+parser.add_argument("--run-date", type=_parse_date, default=today)
+parser.add_argument("--run-id", default=None)
+parser.add_argument("--step", choices=STEP_CHOICES, default=None)
+parser.add_argument("--trial-id", default=None)
+parser.add_argument("--subtrial-id", default=None)
+parser.add_argument("--limit-subtrials", type=int, default=None)
+parser.add_argument("--image-csv-uri", default=None)
+parser.add_argument("--classical-csv-uri", default=None)
+parser.add_argument("--raw-prefix-root", default=None)
+parser.add_argument("--batch-run-id", default=None)
+parser.add_argument("--inference-output-dir", default=None)
+parser.add_argument("--trait", default=None)
+parser.add_argument("--data-collected-date", type=_parse_date, default=None)
+parser.add_argument("--data-collected-dates", type=_parse_dates, default=None)
+```
+
+Date selection precedence (highest first):
+1. `--data-collected-dates` (multi-date mode, `+`-delimited list)
+2. `--data-collected-date` (single date, `data_collection` field filter)
+3. `--run-date` (single date, `upload_timestamp` UTC window filter)
 
 ## 4.3 Core runtime models
 
@@ -659,43 +783,93 @@ class SubtrialState:
 ### 4.4.1 Job-level pseudocode
 
 ```python
-async def main() -> int:
-    run_id = generate_run_id_utc()
-    bootstrap_logger = build_bootstrap_logger(run_id)
+def run() -> int:
+    args = parse_args()
+    run_id = args.run_id or generate_run_id_utc()
+    config = load_and_validate_config()
+    clients = init_clients(config)
+    logger = init_structured_logger(run_id, clients.logging)
 
-    try:
-        config = load_and_validate_config()
-        clients = init_clients(config)
-        logger = init_structured_logger(run_id, clients.logging)
-    except Exception as exc:
-        bootstrap_logger.log_exception(stage="bootstrap", status="failed", exc=exc)
-        emit_failed_summary_if_possible()
-        return 1
+    if args.smoke_test:
+        return smoke_test(config, logger)
 
-    try:
-        subtrials = await discover_active_subtrials(clients.firestore, logger)
-    except DiscoveryFatalError as exc:
-        logger.log_exception(stage="discovery", status="fatal", exc=exc)
-        logger.log(stage="summary", status="failed", ...)
-        return 1
+    if args.step and args.step != "full":
+        return run_step(config, args, ...)
 
-    if not subtrials:
-        logger.log(stage="summary", status="complete", total_subtrials_discovered=0, ...)
-        return 0
+    # Multi-date mode short-circuits the discovery loop and processes
+    # one explicitly-supplied subtrial across the supplied dates.
+    if args.data_collected_dates:
+        subtrial = load_subtrial_info(args.trial_id, args.subtrial_id)
+        state = process_multi_date(
+            config, ...,
+            subtrial=subtrial,
+            dates=args.data_collected_dates,
+        )
+        return 1 if state.status == "failed" else 0
 
-    states: list[SubtrialState] = []
-
+    # Single-date mode (default) discovers active subtrials and processes
+    # each sequentially.
+    subtrials = select_subtrials(args, logger)
+    states = []
     for index, subtrial in enumerate(subtrials, start=1):
-        state = await process_one_subtrial(index, subtrial, config, clients, logger)
-        states.append(state)
-
+        states.append(process_subtrial(
+            config, ...,
+            subtrial=subtrial,
+            index=index,
+            data_collected_date=args.data_collected_date.isoformat() if args.data_collected_date else None,
+        ))
     summary = build_summary(states)
-    logger.log(stage="summary", status=summary.status, **summary.to_log_fields())
-
-    return 1 if summary.total_subtrials_failed > 0 else 0
+    return 1 if summary.failed > 0 else 0
 ```
 
-### 4.4.2 Subtrial-level pseudocode
+### 4.4.2 Multi-date pseudocode
+
+```python
+def process_multi_date(config, *, subtrial, dates, ...) -> SubtrialState:
+    state = SubtrialState(...)
+    all_inference_results: list[InferenceJobResult] = []
+    all_classical_documents: list[ScannedDocument] = []
+
+    # Phase 1: per-date scan/csv/preprocess/inference
+    for date_index, dc_date in enumerate(dates):
+        try:
+            docs = scan_subtrial_documents(..., data_collected_date=dc_date.isoformat())
+            if not docs.image_documents and not docs.classical_documents:
+                continue
+
+            all_classical_documents.extend(docs.classical_documents)
+
+            if docs.image_documents:
+                csv_uris = upload_per_protocol_csvs(docs.image_documents, ...)
+                preprocessing = run_preprocessing(csv_uris[0], batch_run_id=f"{run_id}-{date_index:03d}-{dc_date}", ...)
+                if not preprocessing.success:
+                    continue
+                selected_docs = filter_to_selected(docs.image_documents, preprocessing)
+                groups = group_documents_by_protocol_trait(selected_docs, ...)
+                inference_results = run_inference(groups=groups, ...)
+                successful = [r for r in inference_results if r.success]
+                all_inference_results.extend(successful)
+        except Exception as exc:
+            logger.log_exception("multi_date_phase1", "failed", exc, ...)
+            continue
+
+    # Phase 2: combined CV + per-trait classical extraction
+    if all_inference_results:
+        run_cv_extractions(inference_results=all_inference_results, ...)
+
+    if all_classical_documents:
+        groups = group_documents_by_protocol_trait(all_classical_documents, ...)
+        docs_by_id = {d.document_id: d for d in all_classical_documents}
+        for group in groups:
+            group_docs = [docs_by_id[did] for did in group.source_document_ids if did in docs_by_id]
+            group_csv_uri = upload_classical_csv(documents=group_docs, ...)
+            if group_csv_uri:
+                run_classical_extractions(input_csv=group_csv_uri, groups=[group], ...)
+
+    return state
+```
+
+### 4.4.3 Subtrial-level pseudocode (single-date mode)
 
 ```python
 async def process_one_subtrial(...) -> SubtrialState:
@@ -757,18 +931,32 @@ async def process_one_subtrial(...) -> SubtrialState:
    - `trials/{trial_id}/subtrials.where("status", "==", "active")`
 3. Return `list[SubtrialInfo]`.
 
-### 4.5.2 UTC scanning window
+### 4.5.2 Date filter modes
 
-Use an inclusive/exclusive window to avoid precision bugs:
+The scanner supports two filter modes:
+
+**Upload-timestamp mode** (default, `--run-date`):
+
+Use an inclusive/exclusive UTC window:
 
 ```python
 start = datetime.combine(utc_date, time.min, tzinfo=timezone.utc)
 end = start + timedelta(days=1)
-
 query.where("upload_timestamp", ">=", start).where("upload_timestamp", "<", end)
 ```
 
-This is safer than `[00:00:00, 23:59:59]`, because timestamps can contain fractional seconds.
+**`data_collection`-string mode** (`--data-collected-date` or `--data-collected-dates`):
+
+Filter on the `data_collection` string field using a prefix range:
+
+```python
+next_day = str(date.fromisoformat(target_date) + timedelta(days=1))
+query.where("data_collection", ">=", target_date).where("data_collection", "<", next_day)
+```
+
+This matches values whose ISO-date prefix equals `target_date`. After the Firestore query, an in-memory check (`_matches_data_collection_date`) re-validates the prefix.
+
+Documents missing `data_collection` are silently excluded in this mode. Documents missing `upload_timestamp` are silently excluded in upload-timestamp mode.
 
 ### 4.5.3 Classical scan
 
@@ -846,11 +1034,16 @@ This is recommended for future-safe write-back and join accuracy. If strict comp
 
 | Artifact | Path |
 |---|---|
-| Images raw CSV | `gs://ona-harvest/raw/{run_id}/{trial_id}/{subtrial_id}_images.csv` |
-| Classical raw CSV | `gs://ona-harvest/raw/{run_id}/{trial_id}/{subtrial_id}_classical.csv` |
-| Inference outputs | `gs://ona-harvest/inference/{run_id}/{subtrial_id}/{trait}/...` |
-| CV extraction outputs | `gs://ona-harvest/extraction/{run_id}/{subtrial_id}/{trait}/...` |
-| Classical extraction outputs | `gs://ona-harvest/extraction/{run_id}/{subtrial_id}/classical/{trait}/...` |
+| Images raw CSV | `gs://ona-harvest/raw/{run_id}_images_{protocol_slug}.csv` (single-date) or `gs://ona-harvest/raw/{run_id}_images_{protocol_slug}_{YYYY-MM-DD}.csv` (multi-date phase 1) |
+| Classical raw CSV (per trait group) | `gs://{selected_images_bucket}/{project_name}/{site_name}/{trial_name}/{season}/{field}/{location}/trait_collection/classical-phenotyping/{run_id}_{run_date}_{epoch}.csv` |
+| Inference outputs | `gs://ona-harvest/inference/{run_id}/{subtrial_id}/{trait}/{protocol}/json/...` |
+| CV extraction outputs | `gs://ona-harvest/extraction/{run_id}/{subtrial_id}/{trait}/extraction_outputs/` |
+| Classical extraction outputs | `gs://ona-harvest/extraction/{run_id}/{subtrial_id}/classical/{trait}/extraction_outputs/` |
+
+Notes:
+- The classical CSV path is derived from `project_name`, `site_name`, `trial_name`, `season`, `field`, `location` fields on the source documents. If any of these six fields is missing on every document in a group, `_classical_phenotyping_path` returns `None` and that trait group's CSV upload silently fails.
+- Each classical CSV contains documents for a single `(protocol, canonical_trait)` group. The epoch suffix in the filename ensures uniqueness when multiple groups upload concurrently.
+- In multi-date mode, the classical CSV for each trait group includes all dates' documents for that trait combined.
 
 ### 4.7.2 Safe write strategy
 
@@ -1021,29 +1214,37 @@ Use per-task exception handling inside `submit_and_poll_one` so one failed group
 
 ### 4.11.2 Classical extraction
 
-- Triggered after Classical CSV upload.
-- Run once per valid classical protocol-trait group.
-- RunSpec:
+- Triggered after Classical CSV upload(s).
+- One extraction call per valid classical protocol-trait group, each receiving its own filtered CSV.
+- The caller (`_process_classical_path` or `_process_multi_date` phase 2) must:
+  1. Resolve protocol-trait groups from the classical documents.
+  2. For each group, filter `documents` to those listed in `group.source_document_ids`.
+  3. Upload one classical CSV containing only that subset.
+  4. Call `run_classical_extractions(input_csv=group_csv_uri, groups=[group], ...)` for that single group.
+- This ensures the downstream `ona-trait-extraction` service receives a CSV with a single `(protocol, data_type)` and not a mixed CSV.
+- RunSpec sent to the trait extraction Cloud Run Job:
 
 ```json
 {
   "trait": "<canonical_trait_name>",
   "method": "classical",
-  "input_csv": "gs://ona-harvest/raw/{run_id}/{trial_id}/{subtrial_id}_classical.csv",
-  "output_prefix": "gs://ona-harvest/extraction/{run_id}/{subtrial_id}/classical/{trait}/extraction_outputs/"
+  "input_csv": "<group-specific classical csv uri>",
+  "recursive": true,
+  "planting_date": "<optional ISO-date>"
 }
 ```
 
-### 4.11.3 Subprocess policy
+`planting_date` is added only when `canonical_trait_name == "flowering"` and the subtrial/trial/layout has a planting-date field. If the field is missing for a flowering group, extraction still runs but downstream day-after-planting calculations may be unreliable; a warning is logged.
 
-- Execute:
-  - `python -m trait_extraction.runner.entrypoint --run-spec-json '<json>'`
-- Timeout:
-  - 300 seconds
-- Results:
-  - exit `0`: success
-  - non-zero: failure and capture stderr
-  - timeout: kill subprocess and log timeout
+### 4.11.3 Cloud Run Job invocation policy
+
+- Each extraction is invoked via a single POST to the Cloud Run Jobs API:
+  `POST https://run.googleapis.com/v2/projects/{project}/locations/{region}/jobs/{job_id}:run`
+- The request body uses `overrides.containerOverrides[0].args` to pass `["-m", "trait_extraction.runner.entrypoint", "--run-spec-json", "<json>"]` so the run-spec is delivered inline to the same image rather than via a side-channel CSV / argument list.
+- The orchestrator polls the resulting operation until its `done` field is true, then polls the resolved execution until it reaches a terminal state (`completed`, `failed`, `cancelled`).
+- Per-run audit records are written to Firestore at `trait_extraction_runs/{audit_run_id}` with the run-spec, operation name, execution name, status counts, and final timestamps.
+- Polling cadence: 15 second sleeps between status checks. Total timeout: `trait_extraction_poll_timeout_s` (default 24h).
+- No client-side retries: a failed extraction returns a failed `ExtractionRunResult`; the per-run audit record records the final terminal status.
 
 ## 4.12 CSV write-back LLD
 
@@ -1214,7 +1415,7 @@ Any of the following occurs:
 | Preprocessor status polling | Repeated until terminal/timeout/error cap |
 | Inference batch start | No retry |
 | Inference status polling | Repeated until terminal/timeout |
-| Trait extraction subprocess | No retry |
+| Trait extraction Cloud Run Job | No retry beyond the polling loop |
 | Firestore write-back | No retry beyond batched writes |
 | CSV write-back | No retry unless re-run of job |
 
@@ -1230,51 +1431,39 @@ Any of the following occurs:
 
 ## 4.17 Testing strategy
 
-### 4.17.1 Unit tests
+The test suite lives at `cron_job/tests/` and uses pytest with `monkeypatch` for service stubbing. There are no property-based tests, no `respx` HTTP fixtures, and no full-stack integration harness; the suite stays fast and deterministic by mocking adapters and using small in-memory fakes for Firestore and GCS.
 
-Cover:
-- logger JSON structure
-- active trial/subtrial discovery
-- nested image scans
-- timestamp filtering
-- CSV deterministic header logic
-- GCS upload/delete/download/list
-- preprocessor polling terminal conditions
-- inference concurrent submission and timeout behavior
-- trait mapping and extraction RunSpec construction
-- CSV write-back merge logic
-- Firestore batch chunking and error swallowing
-- orchestrator exit code behavior
+### 4.17.1 Test files and what they cover
 
-### 4.17.2 Property tests
+| File | Focus |
+|---|---|
+| `test_daily_pipeline_units.py` | CSV header determinism, protocol/trait grouping, Firestore discovery dedup, scan window math, `process_subtrial` skip/fail paths, `CloudRunJobClient` inline run-spec body |
+| `test_daily_pipeline_adapters.py` | argparse defaults, multi-date `+`/`;` separator parsing, step prefix overrides, preprocessor request body, inference batch submission, `_execution_status` mapping, `run()` exit codes, multi-date routing |
+| `test_csv_assembler.py` | `_classical_phenotyping_path` six-field requirement, image URI composition, `_meta_image_uuid` stem extraction with fallbacks |
+| `test_csv_writeback.py` | Joining extraction CSVs onto raw CSV by `document_id` / `plot_uid`, trait-suffixed columns, excluded source columns, missing-raw and failed-extraction handling |
+| `test_gcs_client.py` | URI parsing, upload/download/delete/exists, `safe_delete_many` error swallowing, prefix listing |
+| `test_firestore_scanner.py` | UTC day window, `_is_in_window` boundaries, `_matches_data_collection_date` prefix filter, identity helpers `_make_trial_id` / `_make_subtrial_id` |
+| `test_firestore_writeback.py` | `_truthy` parsing, `read_selected_image_rows` decoding, `build_selected_image_prefixes` selection logic, batch chunking by 400, error swallowing on commit failures |
+| `test_logger.py` | Required JSON schema (`run_id` / `stage` / `status` / `timestamp`), kwargs merging, exception traceback formatting, stdout fallback |
+| `test_trait_extractor.py` | CV dedup by `(canonical_trait, output_gcs_path)`, planting-date attached only to flowering, classical per-group RunSpec, failure capture, `_execution_status` cancelled paths |
+| `test_classical_path.py` | One classical CSV per trait group, no-groups → failed, no-docs → not_applicable, partial-upload-failure isolation |
+| `test_multi_date_orchestration.py` | Per-date sequential scans, combined CV extraction call, per-trait classical CSV uploads in phase 2, per-date failure isolation |
 
-Retain the provided property test ideas:
+### 4.17.2 Shared fixtures
 
-- every discovered subtrial processed exactly once
-- failed subtrial does not skip later subtrials
-- summary count consistency
-- polling termination
-- bounded backoff
-- deterministic CSV headers
-- per-group fault isolation
-- write-back merge correctness
-- RunSpec correctness
-- Firestore write-back never changes subtrial status
+`tests/conftest.py` provides:
 
-### 4.17.3 Integration tests
+- `CaptureLogger` — drop-in for the structured logger that records entries in a list and exposes a `find(stage=, status=)` filter helper.
+- `app_config` — a permissive `AppConfig` with disabled cloud logging and short timeouts.
+- `make_image_doc`, `make_classical_doc`, `make_subtrial_info`, `make_inference_result`, `make_group` — typed builders that hide the boilerplate of constructing dataclass models with realistic defaults.
 
-Use:
-- `respx` for HTTP
-- in-memory GCS fake
-- in-memory Firestore fake
-- mocked subprocess runner
+### 4.17.3 Conventions
 
-Verify:
-- stage ordering
-- CV/classical independence
-- subtrial continuation after failures
-- summary logging
-- final exit code
+- Adapter modules (`services/preprocessor.py`, `services/inference.py`, `services/trait_extractor.py`) are exercised via `monkeypatch.setattr("cron_job.services.<module>.httpx.Client", ...)` with a minimal `HttpClient` fake that records `posts` and `gets`.
+- Firestore is exercised via small `Fake*` classes (snapshots, collection refs, document refs) declared in the test files. There is no shared in-memory Firestore fake; each test scopes the fake to what it asserts on.
+- GCS is exercised via an in-memory dict-backed `InMemoryStorage` declared per-test where needed.
+- Tests assert on log entries (using `CaptureLogger.find()`) when behaviour is observable through logs only.
+- New behaviour added to the orchestration must come with a corresponding test that pins the expected adapter calls or log entries; production code should not be the only source of truth.
 
 ---
 
@@ -1356,8 +1545,11 @@ Known source fields:
 
 | Field | Type | Required for job | Notes |
 |---|---|---:|---|
-| `upload_timestamp` | timestamp | Yes | Missing field means silently excluded. |
-| `image_uri` | string | Recommended | Included in CSV; can be empty if absent. |
+| `upload_timestamp` | timestamp | Yes (upload-timestamp filter mode) | Missing field means silently excluded. |
+| `data_collection` | string | Yes (`data_collection` filter mode) | ISO-date prefix `YYYY-MM-DD` required when filtering by `--data-collected-date(s)`. |
+| `bucket_prefix` | string | Recommended | Combined with `gcs_img_path` to derive `image_uri`. |
+| `gcs_img_path` | string | Recommended | Either a full `gs://` URI or a path appended to `bucket_prefix`. |
+| `image_uri` | string | Recommended | Used directly when set; otherwise derived. CSV column. |
 | Other fields | dynamic | No | Included as CSV metadata. |
 
 Fields attached in-memory from parent:
@@ -1386,11 +1578,20 @@ Known fields:
 
 | Field | Type | Required for job | Notes |
 |---|---|---:|---|
-| `upload_timestamp` | timestamp | Yes | Missing field means silently excluded. |
+| `upload_timestamp` | timestamp | Yes (upload-timestamp filter mode) | Missing field means silently excluded. |
+| `data_collection` | string | Yes (`data_collection` filter mode) | ISO-date prefix `YYYY-MM-DD` is required when filtering by `--data-collected-date(s)`. Missing/non-matching values silently excluded. |
 | `protocol` | string | Yes for grouping | Read directly from doc. |
-| `trait` | string | Yes for grouping | Read directly from doc. |
+| `trait` | string | Yes for grouping | Read directly from doc. Must contain `pod`, `flower`, or `stand` keyword. |
+| `project_name` | string | Yes for classical CSV upload | Used to derive the GCS path. If missing on every doc in a group, that group's CSV upload returns `None` and the group is skipped. |
+| `site_name` | string | Yes for classical CSV upload | Used to derive the GCS path. |
+| `trial_name` | string | Yes for classical CSV upload | Used to derive the GCS path. |
+| `season` | string | Yes for classical CSV upload | Used to derive the GCS path. |
+| `field` | string | Yes for classical CSV upload | Used to derive the GCS path. |
+| `location` | string | Yes for classical CSV upload | Used to derive the GCS path. |
 | `image_uri` | string | Optional | Included as empty if not present. |
 | Other fields | dynamic | No | Included in Classical CSV. |
+
+The six path-derivation fields (`project_name`, `site_name`, `trial_name`, `season`, `field`, `location`) must all be non-empty on at least one document in each `(protocol, trait)` group, or the upload silently fails.
 
 ## 5.3 CSV schemas
 
@@ -1412,12 +1613,14 @@ Recommended additional field:
 collection_path
 ```
 
-### 5.3.2 Classical CSV
+### 5.3.2 Classical CSV (one per trait group)
 
 Path:
 ```text
-gs://ona-harvest/raw/{run_id}/{trial_id}/{subtrial_id}_classical.csv
+gs://{selected_images_bucket}/{project_name}/{site_name}/{trial_name}/{season}/{field}/{location}/trait_collection/classical-phenotyping/{run_id}_{run_date}_{epoch}.csv
 ```
+
+Each CSV contains documents for a single `(protocol, canonical_trait)` group. The trait extraction service requires a single protocol and data_type per CSV.
 
 Header rule:
 
@@ -1650,7 +1853,7 @@ The CSV write-back module needs a stable output contract that includes:
 - preferably `collection_path`
 - a flat or normalizable measurement payload
 
-If the CLI emits heterogeneous JSON/CSV per trait, `csv_writeback.py` should use trait-specific adapters behind a shared normalization interface.
+If the CLI emits heterogeneous JSON/CSV per trait, `services/csv/writeback.py` should use trait-specific adapters behind a shared normalization interface.
 
 ---
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 
-from cron_job.models import CanonicalTrait, ProtocolTraitGroup, ScannedDocument
+from cron_job.schemas.models import CanonicalTrait, ProtocolTraitGroup, ScannedDocument
 
 
 TRAIT_KEYWORDS: tuple[tuple[str, CanonicalTrait], ...] = (

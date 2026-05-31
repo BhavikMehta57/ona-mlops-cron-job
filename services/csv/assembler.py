@@ -7,8 +7,8 @@ from datetime import date, datetime
 from pathlib import PurePosixPath
 from typing import Any
 
-from cron_job import gcs_client
-from cron_job.models import ScannedDocument
+from cron_job.services import gcs as gcs_client
+from cron_job.schemas.models import ScannedDocument
 
 
 LEADING_COLUMNS = ["collection_name", "document_id", "image_uri", "protocol", "trait"]

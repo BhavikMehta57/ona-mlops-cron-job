@@ -6,8 +6,8 @@ from typing import Callable
 import httpx
 
 from cron_job.core.config import AppConfig
-from cron_job.gcs_client import parse_gcs_uri
-from cron_job.models import PreprocessorResult
+from cron_job.services.gcs import parse_gcs_uri
+from cron_job.schemas.models import PreprocessorResult
 
 
 TERMINAL_SUCCESS = {"success", "completed", "complete"}

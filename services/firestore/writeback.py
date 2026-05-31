@@ -9,9 +9,9 @@ from typing import Any
 
 from firebase_admin import firestore
 
-from cron_job.csv_assembler import _meta_image_uuid
-from cron_job.gcs_client import download_text, parse_gcs_uri
-from cron_job.models import InferenceJobResult, ScannedDocument
+from cron_job.services.csv.assembler import _meta_image_uuid
+from cron_job.services.gcs import download_text, parse_gcs_uri
+from cron_job.schemas.models import InferenceJobResult, ScannedDocument
 
 
 def _truthy(value: Any) -> bool:

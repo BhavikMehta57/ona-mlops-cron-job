@@ -27,7 +27,7 @@ Set local environment variables:
 ```powershell
 $env:GCS_BUCKET="ona-harvest"
 $env:PREPROCESSOR_URL="https://ona-api.ona.farm/web/pre_processing"
-$env:INFERENCE_URL="https://ona-infer-test-888018102762.us-central1.run.app"
+$env:INFERENCE_URL="https://ona-infer-888018102762.us-central1.run.app"
 $env:GCP_PROJECT_ID="artemis-418513"
 $env:GCP_RUN_REGION="us-central1"
 $env:TRAIT_EXTRACTION_JOB_ID="ona-trait-extraction"
@@ -174,6 +174,34 @@ gcloud run jobs execute daily-pipeline-cron-job `
   --wait `
   --args "--run-date=YYYY-MM-DD","--run-id=manual-YYYYMMDD-001"
 ```
+
+### Date selection arguments
+
+The job accepts three mutually-relevant date arguments. Precedence order: `--data-collected-dates` > `--data-collected-date` > `--run-date`.
+
+| Argument | Format | Behavior |
+|---|---|---|
+| `--run-date` | `YYYY-MM-DD` | Filters Firestore by `upload_timestamp` UTC window. Defaults to today. Used when neither of the other two flags is supplied. |
+| `--data-collected-date` | `YYYY-MM-DD` | Filters Firestore by the `data_collection` string field for a single date. Single-date pipeline. |
+| `--data-collected-dates` | `YYYY-MM-DD+YYYY-MM-DD+...` | Multi-date pipeline. Phase 1 runs scan, csv upload, preprocessing, and inference per-date sequentially. Phase 2 runs trait extraction once with the combined inference results and per-trait combined classical CSVs. Use `+` (or `;`) as separator because Cloud Run splits `--args` on commas. |
+
+Single date with the `data_collection` field filter:
+
+```powershell
+gcloud run jobs execute daily-pipeline-cron-job --region us-central1 --wait `
+  --args "--data-collected-date,2025-11-15,--trial-id,naro-main-trial--Namulonge--NARO,--subtrial-id,2025--UGA--Bushbean--September--field_1--Namulonge"
+```
+
+Multiple dates in a single execution (sequential per-date phase 1, combined phase 2 trait extraction):
+
+```powershell
+gcloud run jobs execute mlops-pipeline-job --region us-central1 --wait `
+  --args "--data-collected-dates,2025-11-15+2025-11-17+2025-11-19+2025-11-22,--trial-id,naro-main-trial--Namulonge--NARO,--subtrial-id,2025--UGA--Bushbean--September--field_1--Namulonge"
+```
+
+Notes:
+- Always include `--wait` when chaining executions in a script. Without it, `gcloud` returns immediately and the next execution starts before the previous one finishes.
+- Cloud Run splits the `--args` string on commas to form `argv`. Inside a single arg value, use `+` to join multiple dates so they reach `--data-collected-dates` as one value.
 
 Create the scheduler only after the manual Cloud Run Job exits `0`:
 
