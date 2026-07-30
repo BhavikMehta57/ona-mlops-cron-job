@@ -1,0 +1,122 @@
+# Databricks Asset Bundle
+# End-to-end MLOps pipeline orchestrator.
+#
+# This bundle defines a single Databricks Workflow ("job") that runs the whole
+# pipeline end to end. The three preprocessing stages currently run as
+# name-announcing placeholders (no real preprocessing jobs are triggered),
+# followed by the real Batch Inference and Trait Extraction stages:
+#
+#   Preprocessing - Batching (placeholder)
+#     -> Preprocessing - QScoring (placeholder)
+#       -> Preprocessing - Selection (placeholder)
+#         -> Batch Inference
+#           -> Trait Extraction
+#
+# Deploy:
+#   databricks bundle validate -t dev
+#   databricks bundle deploy   -t dev
+#   databricks bundle run ona_e2e_pipeline -t dev
+#
+# Auth is taken from your Databricks CLI profile / DATABRICKS_HOST + DATABRICKS_TOKEN.
+# Nothing secret is committed here.
+
+bundle:
+  name: ona-mlops-e2e
+
+include:
+  - resources/*.job.yml
+
+# ---------------------------------------------------------------------------
+# Permissions (bundle source of truth).
+#
+# Because this job is deployed from a bundle, permissions CANNOT be changed in
+# the Databricks UI. Edit the entries below and redeploy:
+#   databricks bundle deploy -t dev
+#
+# Top-level `permissions` apply to ALL resources in the bundle (the job here).
+# Each entry needs exactly one principal (user_name | group_name |
+# service_principal_name) and a `level`.
+#
+# Valid job levels: CAN_VIEW, CAN_MANAGE_RUN, CAN_MANAGE, IS_OWNER
+#
+# Edit these to your real users/groups/service principals:
+permissions:
+  - group_name: artemis-technical
+    level: CAN_MANAGE
+  - user_name: bjmehta2001@gmail.com
+    level: CAN_MANAGE
+  # - user_name: t.mungubariki@cgiar.org
+  #   level: CAN_MANAGE
+  # - group_name: data-engineers
+  #   level: CAN_MANAGE_RUN
+  # - service_principal_name: <application-id-of-service-principal>
+  #   level: CAN_MANAGE
+
+# ---------------------------------------------------------------------------
+# Variables. Job IDs default to the existing jobs in the workspace and can be
+# overridden per target. Pipeline parameters are exposed so the whole run can
+# be re-parameterised from the CLI without editing YAML:
+#   databricks bundle run ona_e2e_pipeline -t dev \
+#     --var="inference_run_id=312203213270542,inference_trait_type=plant_stand"
+# ---------------------------------------------------------------------------
+variables:
+  # --- Existing job IDs -----------------------------------------------------
+  # Preprocessing stages run as name-announcing placeholders, so their job IDs
+  # are intentionally omitted here.
+  inference_job_id:
+    description: Job ID for "Batch Inference".
+    default: "883613979748353"
+  trait_extraction_job_id:
+    description: Job ID for "Trait Extraction".
+    default: "412831839181191"
+
+  # --- Batch Inference parameters -------------------------------------------
+  inference_run_id:
+    default: "312203213270542"
+  inference_input_prefix:
+    default: "/Workspace/Users/t.mungubariki@cgiar.org/ona-infer-main/beanbush_plantstand_bb_344_2-1/test"
+  inference_input_mode:
+    default: "glob"
+  inference_save_json_folder:
+    default: "/Volumes/use1_prod_artemis_catalog_3718194974443840/production/data/ona-infer-main/_fg05_smoke/images_inference/manual"
+  inference_trait_type:
+    default: "plant_stand"
+  inference_confidence:
+    default: "0.5"
+  inference_limit:
+    default: "5"
+  inference_num_partitions:
+    default: "4"
+
+  # --- Trait Extraction parameters ------------------------------------------
+  # input_dir is NOT a standalone variable: it is wired directly to
+  # inference_save_json_folder in resources/end_to_end_pipeline.job.yml, so
+  # overriding inference_save_json_folder redirects BOTH the Batch Inference
+  # output and the Trait Extraction input in a single override. output_prefix
+  # defaults to a sibling "traits" folder and can be overridden independently.
+  #
+  # trait_extraction_trait MUST refer to the SAME trait as inference_trait_type,
+  # but the two services use different vocabularies, so set them together:
+  #   inference_trait_type=plant_stand  ->  trait_extraction_trait=plantstand
+  #   inference_trait_type=flower       ->  trait_extraction_trait=flowering
+  #   inference_trait_type=pod          ->  trait_extraction_trait=pods
+  # Valid trait_extraction_trait values: pods | flowering | plantstand.
+  trait_extraction_trait:
+    description: Trait for extraction (pods | flowering | plantstand); must match inference_trait_type.
+    default: "plantstand"
+  trait_extraction_output_prefix:
+    description: Output folder for Trait Extraction results.
+    default: "/Volumes/use1_prod_artemis_catalog_3718194974443840/production/data/ona-infer-main/_fg05_smoke/traits/manual"
+
+targets:
+  dev:
+    mode: development
+    default: true
+    # Set your workspace host here or via the DATABRICKS_HOST env var / CLI profile.
+    # workspace:
+    #   host: https://<your-workspace>.cloud.databricks.com
+
+  prod:
+    mode: production
+    # workspace:
+    #   host: https://<your-workspace>.cloud.databricks.com

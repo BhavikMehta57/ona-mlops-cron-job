@@ -1,0 +1,96 @@
+# End-to-end pipeline orchestrator job.
+#
+# Each task uses `run_job_task` to trigger an existing job in the workspace by
+# its job ID. Tasks are linked with `depends_on`, so Databricks runs them
+# strictly in order and stops the run if any upstream task fails.
+#
+# `job_parameters` under a `run_job_task` are passed to the triggered run. For
+# the override to take effect, the target job must declare matching named job
+# parameters (Workflow UI -> Job details -> Parameters, referenced in tasks as
+# {{job.parameters.<name>}}). If a target job hardcodes its own task parameters,
+# it simply runs with those and the block below is a no-op you can delete.
+
+resources:
+  jobs:
+    ona_e2e_pipeline:
+      name: "ONA - End to End Pipeline"
+
+      # Fail fast: a failure anywhere aborts the whole run.
+      max_concurrent_runs: 1
+
+      # Uncomment to run on a schedule (UTC). Mirrors the old daily cron.
+      # trigger:
+      #   pause_status: UNPAUSED
+      #   periodic:
+      #     interval: 1
+      #     unit: DAYS
+
+      # Serverless compute for the placeholder notebook tasks.
+      environments:
+        - environment_key: default
+          spec:
+            client: "1"
+
+      tasks:
+        # 1) Preprocessing - Batching (placeholder - announces name only)
+        - task_key: preprocessing_batching
+          environment_key: default
+          notebook_task:
+            notebook_path: ./notebooks/placeholder_stage.py
+            base_parameters:
+              stage_name: "Preprocessing - Batching"
+
+        # 2) Preprocessing - QScoring (placeholder - announces name only)
+        - task_key: preprocessing_qscoring
+          depends_on:
+            - task_key: preprocessing_batching
+          environment_key: default
+          notebook_task:
+            notebook_path: ./notebooks/placeholder_stage.py
+            base_parameters:
+              stage_name: "Preprocessing - QScoring"
+
+        # 3) Preprocessing - Selection (placeholder - announces name only)
+        - task_key: preprocessing_selection
+          depends_on:
+            - task_key: preprocessing_qscoring
+          environment_key: default
+          notebook_task:
+            notebook_path: ./notebooks/placeholder_stage.py
+            base_parameters:
+              stage_name: "Preprocessing - Selection"
+
+        # 4) Batch Inference
+        - task_key: batch_inference
+          depends_on:
+            - task_key: preprocessing_selection
+          run_job_task:
+            job_id: ${var.inference_job_id}
+            job_parameters:
+              run_id: ${var.inference_run_id}
+              input_prefix: ${var.inference_input_prefix}
+              input_mode: ${var.inference_input_mode}
+              save_json_folder: ${var.inference_save_json_folder}
+              trait_type: ${var.inference_trait_type}
+              confidence: ${var.inference_confidence}
+              limit: ${var.inference_limit}
+              num_partitions: ${var.inference_num_partitions}
+
+        # 5) Trait Extraction
+        - task_key: trait_extraction
+          depends_on:
+            - task_key: batch_inference
+          run_job_task:
+            job_id: ${var.trait_extraction_job_id}
+            job_parameters:
+              # input_dir is wired to the Batch Inference output folder
+              # (inference_save_json_folder) so overriding that one variable
+              # redirects both stages to the same folder. output_prefix is
+              # independently overridable via trait_extraction_output_prefix.
+              # trait must match inference_trait_type (see databricks.yml note);
+              # method is computer_vision, validate_only is false (real run), and
+              # firestore_upload is true so results are written to Firestore.
+              run_spec_json: '{"trait":"${var.trait_extraction_trait}","method":"computer_vision","input_dir":"${var.inference_save_json_folder}","output_prefix":"${var.trait_extraction_output_prefix}","extra":{"validate_only":false,"firestore_upload":true}}'
+
+      queue:
+        enabled: true

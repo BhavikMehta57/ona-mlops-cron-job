@@ -3,17 +3,14 @@
 
 # Ignore log files
 logs/
-cloud_log/
 local_test_output/
 
 # Ignore runs
 naro-main-trial/
 
-# Firebase Files
-artemis-418513-firebase-adminsdk-fbsvc-c732b80b5c.json
-
-# GCloud SA
-artemis-418513-8f1fa8a5c094.json
+# Databricks Asset Bundle build artifacts
+.databricks/
+build/
 
 # Cache Files
 **/__pycache__/
