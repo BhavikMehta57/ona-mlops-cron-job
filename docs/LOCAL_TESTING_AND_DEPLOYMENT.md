@@ -27,7 +27,7 @@ Set local environment variables:
 ```powershell
 $env:GCS_BUCKET="ona-harvest"
 $env:PREPROCESSOR_URL="https://ona-api.ona.farm/web/pre_processing"
-$env:INFERENCE_URL="https://ona-infer-888018102762.us-central1.run.app"
+$env:INFERENCE_URL="https://ona-infer-d7mf2sxn5a-uc.a.run.app"
 $env:GCP_PROJECT_ID="artemis-418513"
 $env:GCP_RUN_REGION="us-central1"
 $env:TRAIT_EXTRACTION_JOB_ID="ona-trait-extraction"
