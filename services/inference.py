@@ -18,9 +18,9 @@ FAILED_STATUSES = {"failed", "error", "cancelled", "canceled"}
 # Mapping from inference_trait_type to (model_id, confidence)
 TRAIT_MODEL_MAP: dict[str, tuple[str, float]] = {
     "flower": ("dup_merged_1_to_15_flower_inst_seg-mhpnh/8", 0.34),
-    "pod": ("artemis2_pod_segmentation_batch3-gd8ng/12", 0.25),
-    "plant_stand": ("bushbean_stand_count_diversity_gcp/4", 0.5),
-    "crop_row": ("crop_row_detection-qwieb/3", 0.5),
+    "pod": ("artemis2_pod_segmentation_batch3-gd8ng/53", 0.25),
+    "plant_stand": ("beanbush_plantstand_bb_344_2/6", 0.5),
+    "crop_row": ("crop_row_segmentation/1", 0.5),
 }
 
 
