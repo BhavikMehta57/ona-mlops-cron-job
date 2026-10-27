@@ -1,96 +1,115 @@
-# End-to-end pipeline orchestrator job.
-#
-# Each task uses `run_job_task` to trigger an existing job in the workspace by
-# its job ID. Tasks are linked with `depends_on`, so Databricks runs them
-# strictly in order and stops the run if any upstream task fails.
-#
-# `job_parameters` under a `run_job_task` are passed to the triggered run. For
-# the override to take effect, the target job must declare matching named job
-# parameters (Workflow UI -> Job details -> Parameters, referenced in tasks as
-# {{job.parameters.<name>}}). If a target job hardcodes its own task parameters,
-# it simply runs with those and the block below is a no-op you can delete.
-
 resources:
   jobs:
     ona_e2e_pipeline:
       name: "ONA - End to End Pipeline"
-
-      # Fail fast: a failure anywhere aborts the whole run.
       max_concurrent_runs: 1
 
-      # Uncomment to run on a schedule (UTC). Mirrors the old daily cron.
-      # trigger:
-      #   pause_status: UNPAUSED
-      #   periodic:
-      #     interval: 1
-      #     unit: DAYS
+      parameters:
+        - name: input_csv
+          default: ""
+        - name: run_root
+          default: "${var.pipeline_runs_root}/{{job.run_id}}"
+        - name: inference_confidence
+          default: "${var.inference_confidence}"
+        - name: inference_limit
+          default: "${var.inference_limit}"
+        - name: inference_num_partitions
+          default: "${var.inference_num_partitions}"
 
-      # Serverless compute for the placeholder notebook tasks.
       environments:
         - environment_key: default
           spec:
             client: "1"
 
       tasks:
-        # 1) Preprocessing - Batching (placeholder - announces name only)
         - task_key: preprocessing_batching
-          environment_key: default
-          notebook_task:
-            notebook_path: ./notebooks/placeholder_stage.py
-            base_parameters:
-              stage_name: "Preprocessing - Batching"
+          run_job_task:
+            job_id: ${var.batching_job_id}
+            job_parameters:
+              run_id: "{{job.run_id}}"
+              input_csv: "{{job.parameters.input_csv}}"
+              source_volume: "${var.source_volume}"
+              run_root: "{{job.parameters.run_root}}"
+              fail_on_unsupported_traits: "${var.fail_on_unsupported_traits}"
 
-        # 2) Preprocessing - QScoring (placeholder - announces name only)
         - task_key: preprocessing_qscoring
           depends_on:
             - task_key: preprocessing_batching
-          environment_key: default
-          notebook_task:
-            notebook_path: ./notebooks/placeholder_stage.py
-            base_parameters:
-              stage_name: "Preprocessing - QScoring"
+          run_job_task:
+            job_id: ${var.qscoring_job_id}
+            job_parameters:
+              run_id: "{{job.run_id}}"
+              input_manifest: "{{job.parameters.run_root}}/manifests/batching.json"
+              image_volume_root: "${var.image_volume_root}"
+              run_root: "{{job.parameters.run_root}}"
 
-        # 3) Preprocessing - Selection (placeholder - announces name only)
         - task_key: preprocessing_selection
           depends_on:
             - task_key: preprocessing_qscoring
-          environment_key: default
-          notebook_task:
-            notebook_path: ./notebooks/placeholder_stage.py
-            base_parameters:
-              stage_name: "Preprocessing - Selection"
+          run_job_task:
+            job_id: ${var.selection_job_id}
+            job_parameters:
+              run_id: "{{job.run_id}}"
+              input_manifest: "{{job.parameters.run_root}}/manifests/qscoring.json"
+              image_volume_root: "${var.image_volume_root}"
+              selected_images_root: "${var.selected_images_root}"
+              run_root: "{{job.parameters.run_root}}"
 
-        # 4) Batch Inference
-        - task_key: batch_inference
+        - task_key: build_routes
           depends_on:
             - task_key: preprocessing_selection
-          run_job_task:
-            job_id: ${var.inference_job_id}
-            job_parameters:
-              run_id: ${var.inference_run_id}
-              input_prefix: ${var.inference_input_prefix}
-              input_mode: ${var.inference_input_mode}
-              save_json_folder: ${var.inference_save_json_folder}
-              trait_type: ${var.inference_trait_type}
-              confidence: ${var.inference_confidence}
-              limit: ${var.inference_limit}
-              num_partitions: ${var.inference_num_partitions}
+          environment_key: default
+          notebook_task:
+            notebook_path: ./notebooks/build_routes.py
+            base_parameters:
+              selection_manifest: "{{job.parameters.run_root}}/manifests/selection.json"
+              run_root: "{{job.parameters.run_root}}"
+              fail_on_unsupported_traits: "${var.fail_on_unsupported_traits}"
+              trait_extraction_firestore_upload: "${var.trait_extraction_firestore_upload}"
 
-        # 5) Trait Extraction
+        - task_key: batch_inference
+          depends_on:
+            - task_key: build_routes
+          for_each_task:
+            inputs: '{{tasks.build_routes.values.routes}}'
+            concurrency: ${var.route_concurrency}
+            task:
+              task_key: batch_inference_iteration
+              run_job_task:
+                job_id: ${resources.jobs.image_inference.id}
+                job_parameters:
+                  run_id: "{{job.run_id}}-{{input.group_key}}"
+                  input_prefix: "{{input.input_prefix}}"
+                  input_mode: "glob"
+                  save_json_folder: "{{input.inference_output_dir}}"
+                  trait_type: "{{input.inference_trait_type}}"
+                  confidence: "{{job.parameters.inference_confidence}}"
+                  limit: "{{job.parameters.inference_limit}}"
+                  num_partitions: "{{job.parameters.inference_num_partitions}}"
+
         - task_key: trait_extraction
           depends_on:
             - task_key: batch_inference
-          run_job_task:
-            job_id: ${var.trait_extraction_job_id}
-            job_parameters:
-              # input_dir is wired to the Batch Inference output folder
-              # (inference_save_json_folder) so overriding that one variable
-              # redirects both stages to the same folder. output_prefix is
-              # independently overridable via trait_extraction_output_prefix.
-              # trait must match inference_trait_type (see databricks.yml note);
-              # method is computer_vision, validate_only is false (real run), and
-              # firestore_upload is true so results are written to Firestore.
-              run_spec_json: '{"trait":"${var.trait_extraction_trait}","method":"computer_vision","input_dir":"${var.inference_save_json_folder}","output_prefix":"${var.trait_extraction_output_prefix}","extra":{"validate_only":false,"firestore_upload":true}}'
+          for_each_task:
+            inputs: '{{tasks.build_routes.values.routes}}'
+            concurrency: ${var.route_concurrency}
+            task:
+              task_key: trait_extraction_iteration
+              run_job_task:
+                job_id: ${var.trait_extraction_job_id}
+                job_parameters:
+                  run_spec_json: "{{input.run_spec_json}}"
+
+        - task_key: aggregate_results
+          depends_on:
+            - task_key: trait_extraction
+          environment_key: default
+          notebook_task:
+            notebook_path: ./notebooks/aggregate_results.py
+            base_parameters:
+              run_root: "{{job.parameters.run_root}}"
+              route_manifest: "{{tasks.build_routes.values.route_manifest}}"
+              selection_manifest: "{{job.parameters.run_root}}/manifests/selection.json"
 
       queue:
         enabled: true

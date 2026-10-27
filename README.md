@@ -1,108 +1,110 @@
-# ONA MLOps — End-to-End Pipeline (Databricks)
+# ONA MLOps end-to-end Databricks workflow
 
-Orchestrates the full ONA pipeline on Databricks by chaining the existing jobs
-in order:
+The Databricks bundle is the production source of truth for this pipeline:
 
-```
-Preprocessing - Batching
-  -> Preprocessing - QScoring
-    -> Preprocessing - Selection
-      -> Batch Inference
-        -> Trait Extraction
+```text
+Batching -> Quality scoring -> Image selection -> Dynamic routing
+         -> Batch inference (per crop/trait/protocol)
+         -> Trait extraction (per crop/trait/protocol)
+         -> Final result manifest
 ```
 
-There are two ways to run the pipeline. Use whichever fits your workflow.
+## Dynamic routing
 
-## Existing job IDs
+The batching job inspects the incoming export instead of requiring an operator to
+choose one trait manually. It reads:
 
-| Stage                    | Job ID            |
-|--------------------------|-------------------|
-| Preprocessing - Batching | 884636592596793   |
-| Preprocessing - QScoring | 357955527418592   |
-| Preprocessing - Selection| 1059952483174194  |
-| Batch Inference          | 883613979748353   |
-| Trait Extraction         | 412831839181191   |
+- trait: `img_trait`, `plot_trait`, `trait`, or `Trait`
+- protocol: `img_protocol`, `plot_protocol`, or `protocol`
+- crop: an explicit crop column when present, otherwise the crop component of a
+  season such as `2025--KEN--Cowpea--November`
 
----
+Supported routes are:
 
-## Option A — Declarative Databricks Workflow (recommended)
+| Detected value | Batch inference | Trait extraction |
+|---|---|---|
+| pod/pods | `pod` | `pods` |
+| flower/flowering | `flower` | `flowering` |
+| plant stand/emergence | `plant_stand` | `plantstand` |
 
-A [Databricks Asset Bundle](https://docs.databricks.com/dev-tools/bundles/index.html)
-defines a single orchestrator job (`ONA - End to End Pipeline`) whose tasks use
-`run_job_task` to trigger each existing job with `depends_on` ordering. Databricks
-handles sequencing, retries, and stops the run if any stage fails.
+Unknown or missing traits fail the routing stage by default so data is never
+silently skipped. Set the bundle variable `fail_on_unsupported_traits=false` only
+when partial processing is intentional.
 
-Files:
-- `databricks.yml` — bundle definition, variables (job IDs + parameters), targets.
-- `resources/end_to_end_pipeline.job.yml` — the orchestrator workflow.
+## Run-scoped data contract
 
-### Prerequisites
-- [Databricks CLI](https://docs.databricks.com/dev-tools/cli/install.html) v0.218+.
-- Auth configured: a CLI profile, or `DATABRICKS_HOST` + `DATABRICKS_TOKEN`.
-- Set your workspace host in `databricks.yml` under the target (or via env).
+Each run writes immutable artifacts under:
 
-### Deploy and run
-```bash
-databricks bundle validate -t dev
-databricks bundle deploy   -t dev
-databricks bundle run ona_e2e_pipeline -t dev
+```text
+/Volumes/.../ona-harvest/pipeline_runs/<databricks-job-run-id>/
+  batched/
+  scored/
+  selected/
+  inference/<crop__trait__protocol>/
+  traits/<crop__trait__protocol>/
+  manifests/
+    batching.json
+    qscoring.json
+    selection.json
+    routes.json
+    final_results.json
 ```
 
-### Override parameters at run time
-```bash
-databricks bundle run ona_e2e_pipeline -t dev \
-  --var="inference_trait_type=pods,inference_limit=100"
+Preprocessing never deletes its input. Every downstream job consumes an explicit
+manifest, making retries deterministic and preventing one run from accidentally
+processing another run's "latest" CSV.
+
+## Deploy
+
+Deploy the parameterized preprocessing child jobs first, then the parent bundle:
+
+```powershell
+cd ..\prepops\image_batching
+databricks bundle deploy -t dev
+
+cd ..\image_qscoring
+databricks bundle deploy -t dev
+
+cd ..\image_selection
+databricks bundle deploy -t dev
+
+cd ..\..\cron_job
+databricks bundle deploy -t dev
 ```
 
-> Note: `job_parameters` passed via `run_job_task` only override a child job if
-> that job declares matching **named job parameters**. If a child job hardcodes
-> its own task parameters, it runs with those and the block is a harmless no-op.
+If a child job was recreated rather than updated, replace its corresponding job ID
+in `databricks.yml` before deploying the parent.
 
----
+## Run
 
-## Option B — Imperative runner (Databricks SDK)
+Always pass the exact Unity Catalog Volume CSV in production:
 
-`main.py` triggers each job in order via the Databricks SDK and polls each run to
-completion. Useful for dynamic, per-run triggering (the equivalent of the old
-`gcloud run jobs execute` loop) or for running inside a notebook / another job.
-
-### Configure
-Auth is resolved by the SDK from `DATABRICKS_HOST`/`DATABRICKS_TOKEN`, a profile
-(`DATABRICKS_CONFIG_PROFILE`), or the notebook/job context. Optional overrides
-via environment variables (see `core/config.py`):
-
-- Job IDs: `BATCHING_JOB_ID`, `QSCORING_JOB_ID`, `SELECTION_JOB_ID`,
-  `INFERENCE_JOB_ID`, `TRAIT_EXTRACTION_JOB_ID`
-- Inference: `INFERENCE_RUN_ID`, `INFERENCE_INPUT_PREFIX`, `INFERENCE_INPUT_MODE`,
-  `INFERENCE_SAVE_JSON_FOLDER`, `INFERENCE_TRAIT_TYPE`, `INFERENCE_CONFIDENCE`,
-  `INFERENCE_LIMIT`, `INFERENCE_NUM_PARTITIONS`
-- Trait extraction: `TRAIT_EXTRACTION_RUN_SPEC_JSON` (full JSON), or the pieces
-  `TRAIT_EXTRACTION_TRAIT`, `TRAIT_EXTRACTION_METHOD`, `TRAIT_EXTRACTION_VALIDATE_ONLY`
-
-### Run
-```bash
-pip install -r requirements.txt
-
-# Validate config + connectivity without triggering jobs:
-python -m cron_job.main --smoke-test
-
-# Run the full pipeline:
-python -m cron_job.main --run-id my-run-001
+```powershell
+databricks bundle run ona_e2e_pipeline -t dev --params `
+  input_csv=/Volumes/use1_prod_artemis_catalog_3718194974443840/production/data/ona-harvest/raw/export.csv
 ```
 
-Exit code is `0` when every stage succeeds, `1` on the first failure.
+For backward compatibility, an empty `input_csv` makes batching choose the newest
+CSV under `ona-harvest/raw`, but explicit input is strongly preferred.
 
----
+The final task prints the result and exposes a Databricks task value named
+`result_manifest`. The same path is always:
 
-## Project layout
+```text
+<run_root>/manifests/final_results.json
 ```
-cron_job/
-├── databricks.yml                       # Asset Bundle (Option A)
-├── resources/
-│   └── end_to_end_pipeline.job.yml       # Orchestrator workflow (Option A)
-├── main.py                               # CLI entrypoint (Option B)
-├── core/config.py                        # Config: job IDs + parameters
-├── orchestrator/pipeline.py              # SDK runner (Option B)
-├── middleware/logger.py                  # Structured JSON logging to stdout
-└── requirements.txt
-```
+
+That manifest contains detected crops, traits, protocols, inference output counts,
+and every trait-result CSV path.
+
+## Cost controls
+
+- All preprocessing shards are handled within one cluster run per stage, avoiding
+  a cluster startup for every plot.
+- Dynamic inference and extraction concurrency defaults to 3.
+- Selection runs inference only for groups containing copied images.
+- `max_concurrent_runs` is 1 to prevent duplicate scheduled processing.
+- Wheels and TensorFlow are pinned to reproducible versions.
+
+The older Python SDK runner remains only for legacy compatibility; it does not
+implement dynamic routing. Use the Databricks bundle workflow for production.

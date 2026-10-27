@@ -1,0 +1,90 @@
+resources:
+  jobs:
+    image_inference:
+      name: "ONA - Batch Inference"
+      description: >-
+        Parameterized FG-05 hosted Roboflow inference job used by the end-to-end
+        crop, trait, and protocol routes.
+      max_concurrent_runs: 1
+      parameters:
+        - name: run_id
+          default: "manual"
+        - name: input_prefix
+          default: ""
+        - name: input_mode
+          default: "glob"
+        - name: save_json_folder
+          default: ""
+        - name: trait_type
+          default: "pod"
+        - name: confidence
+          default: "0.5"
+        - name: limit
+          default: "1000000"
+        - name: num_partitions
+          default: "4"
+
+      environments:
+        - environment_key: default
+          spec:
+            client: "1"
+            dependencies:
+              # Keep the inference SDK from replacing Databricks serverless core
+              # packages with incompatible major versions (notably pandas 3 and
+              # NumPy 2). The wheel intentionally declares broad lower bounds.
+              - numpy==1.26.4
+              - pandas==2.1.4
+              - python-dateutil==2.9.0.post0
+              - fsspec==2024.3.1
+              - requests==2.31.0
+              - /Volumes/use1_prod_artemis_catalog_3718194974443840/production/data/ona-infer-main/_wheels/ona_infer_db-0.1.9-py3-none-any.whl
+
+      tasks:
+        - task_key: inference
+          environment_key: default
+          python_wheel_task:
+            package_name: ona_infer_db
+            entry_point: fg05_inference
+            parameters:
+              - "--run_id"
+              - "{{job.parameters.run_id}}"
+              - "--input_prefix"
+              - "{{job.parameters.input_prefix}}"
+              - "--input_mode"
+              - "{{job.parameters.input_mode}}"
+              - "--save_json_folder"
+              - "{{job.parameters.save_json_folder}}"
+              - "--save_output_folder"
+              - ""
+              - "--show_labels"
+              - "true"
+              - "--write_csv"
+              - "true"
+              - "--trait_type"
+              - "{{job.parameters.trait_type}}"
+              - "--model_id"
+              - ""
+              - "--confidence"
+              - "{{job.parameters.confidence}}"
+              - "--use_two_stage_pipeline"
+              - "auto"
+              - "--crop_row_model_id"
+              - ""
+              - "--num_partitions"
+              - "{{job.parameters.num_partitions}}"
+              - "--secret_scope"
+              - "ona-infer"
+              - "--secret_key"
+              - "roboflow_api_key"
+              - "--catalog"
+              - "use1_prod_artemis_catalog_3718194974443840"
+              - "--schema"
+              - "production"
+              - "--limit"
+              - "{{job.parameters.limit}}"
+          max_retries: 1
+          min_retry_interval_millis: 30000
+          retry_on_timeout: true
+
+      queue:
+        enabled: true
