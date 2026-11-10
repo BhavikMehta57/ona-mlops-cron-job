@@ -36,7 +36,8 @@ variables:
     default: "/Volumes/use1_prod_artemis_catalog_3718194974443840/production/data/ona-harvest/pipeline_runs"
 
   inference_confidence:
-    default: "0.5"
+    # Blank: each trait's confidence from the ONA model catalogue (Admin Portal > Models).
+    default: ""
   inference_limit:
     description: High default means process all selected images while retaining the child-job contract.
     default: "1000000"

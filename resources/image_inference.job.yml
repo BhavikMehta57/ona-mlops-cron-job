@@ -18,7 +18,8 @@ resources:
         - name: trait_type
           default: "pod"
         - name: confidence
-          default: "0.5"
+          # Blank: the trait's confidence from the ONA model catalogue (Admin Portal > Models).
+          default: ""
         - name: limit
           default: "1000000"
         - name: num_partitions
@@ -37,7 +38,7 @@ resources:
               - python-dateutil==2.9.0.post0
               - fsspec==2024.3.1
               - requests==2.31.0
-              - /Volumes/use1_prod_artemis_catalog_3718194974443840/production/data/ona-infer-main/_wheels/ona_infer_db-0.1.9-py3-none-any.whl
+              - /Volumes/use1_prod_artemis_catalog_3718194974443840/production/data/ona-infer-main/_wheels/ona_infer_db-0.1.10-py3-none-any.whl
 
       tasks:
         - task_key: inference

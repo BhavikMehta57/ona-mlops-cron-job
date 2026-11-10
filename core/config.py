@@ -298,7 +298,7 @@ def _default_inference_params() -> dict[str, Any]:
             "ona-infer-main/_fg05_smoke/images_inference/manual",
         ),
         "trait_type": os.getenv("INFERENCE_TRAIT_TYPE", "plant_stand"),
-        "confidence": os.getenv("INFERENCE_CONFIDENCE", "0.5"),
+        "confidence": os.getenv("INFERENCE_CONFIDENCE", ""),  # blank: model catalogue
         "limit": os.getenv("INFERENCE_LIMIT", "5"),
         "num_partitions": os.getenv("INFERENCE_NUM_PARTITIONS", "4"),
     }
