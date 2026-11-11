@@ -15,13 +15,40 @@ from cron_job.schemas.models import InferenceJobResult, ProtocolTraitGroup
 SUCCESS_STATUSES = {"completed", "complete", "success", "succeeded"}
 FAILED_STATUSES = {"failed", "error", "cancelled", "canceled"}
 
-# Mapping from inference_trait_type to (model_id, confidence)
+# Fallback mapping from inference_trait_type to (model_id, confidence). The live values come
+# from the Firestore model catalogue (inference_models, edited in the Admin Portal's Models
+# page); this map is used only for traits the catalogue does not list or when it can't be read.
 TRAIT_MODEL_MAP: dict[str, tuple[str, float]] = {
     "flower": ("dup_merged_1_to_15_flower_inst_seg-mhpnh/8", 0.34),
     "pod": ("artemis2_pod_segmentation_batch3-gd8ng/53", 0.25),
-    "plant_stand": ("beanbush_plantstand_bb_344_2/6", 0.5),
+    "plant_stand": ("cgiar-workspace/bushbean_stand-row_count_diversity-2-rfdetr-medium-t4", 0.47),
     "crop_row": ("crop_row_segmentation/1", 0.5),
 }
+MODEL_CATALOG_COLLECTION = "inference_models"
+
+
+def load_model_catalog(config: AppConfig, logger=None) -> dict[str, tuple[str, float]]:
+    """trait -> (model_id, confidence): the Firestore catalogue over TRAIT_MODEL_MAP."""
+    models = dict(TRAIT_MODEL_MAP)
+    try:
+        from cron_job.db.firestore import get_firestore_client
+
+        docs = [s.to_dict() or {} for s in get_firestore_client(config).collection(MODEL_CATALOG_COLLECTION).stream()]
+    except Exception as exc:  # noqa: BLE001 - the built-in map is the fallback
+        if logger is not None:
+            logger.log("inference", "warning", errors=f"model catalogue unavailable ({exc}); using built-in models")
+        return models
+    for doc in docs:
+        trait = str(doc.get("trait") or "").strip()
+        model_id = str(doc.get("model_id") or "").strip()
+        if not trait or not model_id:
+            continue
+        try:
+            confidence = float(doc.get("confidence_threshold"))
+        except (TypeError, ValueError):
+            confidence = models.get(trait, (None, config.inference_confidence))[1]
+        models[trait] = (model_id, confidence)
+    return models
 
 
 def _backoff(attempt: int) -> int:
@@ -100,6 +127,7 @@ def _submit_and_poll_one(
     group: ProtocolTraitGroup,
     logger,
     sleep: Callable[[float], None] = time.sleep,
+    models: dict[str, tuple[str, float]] | None = None,
 ) -> InferenceJobResult:
     if not group.image_prefixes:
         error = "no selected image prefixes for group"
@@ -125,7 +153,7 @@ def _submit_and_poll_one(
             error=error,
         )
 
-    model_id, model_confidence = TRAIT_MODEL_MAP.get(
+    model_id, model_confidence = (models if models is not None else TRAIT_MODEL_MAP).get(
         group.inference_trait_type, (None, config.inference_confidence)
     )
     if model_id is None:
@@ -376,6 +404,7 @@ def run_inference(
     if not groups:
         return []
 
+    models = load_model_catalog(config, logger)
     results: list[InferenceJobResult] = []
     with ThreadPoolExecutor(max_workers=min(len(groups), 8)) as executor:
         futures = [
@@ -387,6 +416,7 @@ def run_inference(
                 group=group,
                 logger=logger,
                 sleep=sleep,
+                models=models,
             )
             for group in groups
         ]
