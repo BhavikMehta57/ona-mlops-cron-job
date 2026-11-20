@@ -56,9 +56,9 @@ targets:
     mode: development
     default: true
     variables:
-      # The dev E2E job uses the serverless extraction deployment. Production
-      # retains the larger single-node job for memory-heavy flowering runs.
-      trait_extraction_job_id: "502899940876299"
+      # The dev E2E job uses the "Trait Extraction" job deployed from the
+      # trait_extraction prod bundle (wheel 0.2.4, single-node cluster).
+      trait_extraction_job_id: "412831839181191"
       trait_extraction_firestore_upload: "false"
     run_as:
       service_principal_name: 30ae320f-306a-4b4c-be28-b833f978af59
